@@ -22,8 +22,9 @@
 
 */
 
+
 #include <Schedule.h>
-#include <AddrList.h>
+#include <lwip/netif.h>
 
 #include "LEAmDNS_Priv.h"
 
@@ -56,18 +57,54 @@ namespace MDNSImplementation
     MDNSResponder::MDNSResponder
 */
 MDNSResponder::MDNSResponder(void)
-    :   m_pServices(0),
+    :   m_pNetIf(0),
         m_pUDPContext(0),
         m_pcHostname(0),
-        m_pServiceQueries(0),
+        m_pServices(0),
+        m_pQueries(0),
         m_fnServiceTxtCallback(0),
 #ifdef ENABLE_ESP_MDNS_RESPONDER_PASSIV_MODE
-        m_bPassivModeEnabled(true),
-#else
-        m_bPassivModeEnabled(false),
-#endif
-        m_netif(nullptr)
+        m_bPassivModeEnabled(true)
 {
+#else
+        m_bPassivModeEnabled(false)
+{
+#endif
+
+    // Set default host probe result callback
+    setHostProbeResultCallback([this](MDNSResponder * p_pMDNSResponder, String p_pcDomainName, bool p_bProbeResult)->void
+    {
+        DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] defaultHostProbeResultCallback: Host domain '%s.local' is %s\n"), p_pcDomainName.c_str(), (p_bProbeResult ? "free" : "already USED!")););
+
+        (void)p_pMDNSResponder;
+
+        if (true == p_bProbeResult)
+        {
+            // Set station hostname
+            MDNSResponder::setStationHostname(p_pcDomainName.c_str());
+        }
+        else
+        {
+            // Change hostname, use '-' as divider between base name and index
+            char*   pcHostDomainTemp = strdup(p_pcDomainName.c_str());
+            if (pcHostDomainTemp)
+            {
+                if (MDNSResponder::indexDomain(pcHostDomainTemp, "-", 0))
+                {
+                    setHostname(pcHostDomainTemp);
+                }
+                else
+                {
+                    DEBUG_EX_ERR(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] defaultHostProbeResultCallback: FAILED to update host domain (%s)!\n"), p_pcDomainName.c_str()););
+                }
+                free(pcHostDomainTemp);
+            }
+            else
+            {
+                DEBUG_EX_ERR(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] defaultHostProbeResultCallback: FAILED to copy host domain (%s)!\n"), p_pcDomainName.c_str()););
+            }
+        }
+    });
 }
 
 /*
@@ -76,132 +113,72 @@ MDNSResponder::MDNSResponder(void)
 MDNSResponder::~MDNSResponder(void)
 {
 
-    _resetProbeStatus(false);
-    _releaseServiceQueries();
-    _releaseHostname();
-    _releaseUDPContext();
-    _releaseServices();
+    close();
 }
 
 /*
-    MDNSResponder::begin
+    MDNSResponder::begin (hostname, netif)
 
-    Set the host domain (for probing) and install WiFi event handlers for
-    IP assignment and disconnection management. In both cases, the MDNS responder
-    is restarted (reset and restart probe status)
-    Finally the responder is (re)started
+    Set the host domain (for probing), install NetIf event handling and
+    finally (re)start the responder
 
 */
-bool MDNSResponder::begin(const char* p_pcHostname, const IPAddress& p_IPAddress, uint32_t p_u32TTL)
+bool MDNSResponder::begin(const char* p_pcHostname,
+                          netif* p_pNetIf)
 {
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] begin(hostname, netif)\n")););
 
-    (void)p_u32TTL; // ignored
-    bool    bResult = false;
+    bool	bResult = false;
 
-    if (0 == m_pUDPContext)
+    if ((p_pNetIf) &&
+            (!m_pNetIf))  	// avoid multiple calls
     {
-        if (_setHostname(p_pcHostname))
-        {
 
-            //// select interface
-
-            m_netif = nullptr;
-            IPAddress ipAddress = p_IPAddress;
-
-            if (!ipAddress.isSet())
-            {
-
-                IPAddress sta = WiFi.localIP();
-                IPAddress ap = WiFi.softAPIP();
-
-                if (!sta.isSet() && !ap.isSet())
-                {
-
-                    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] internal interfaces (STA, AP) are not set (none was specified)\n")));
-                    return false;
-                }
-
-                if (ap.isSet())
-                {
-
-                    if (sta.isSet())
-                    {
-                        DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] default interface AP selected over STA (none was specified)\n")));
-                    }
-                    else
-                    {
-                        DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] default interface AP selected\n")));
-                    }
-                    ipAddress = ap;
-
-                }
-                else
-                {
-
-                    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] default interface STA selected (none was specified)\n")));
-                    ipAddress = sta;
-
-                }
-
-                // continue to ensure interface is UP
-            }
-
-            // check existence of this IP address in the interface list
-            bool found = false;
-            m_netif = nullptr;
-            for (auto a : addrList)
-                if (ipAddress == a.addr())
-                {
-                    if (a.ifUp())
-                    {
-                        found = true;
-                        m_netif = a.interface();
-                        break;
-                    }
-                    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] found interface for IP '%s' but it is not UP\n"), ipAddress.toString().c_str()););
-                }
-            if (!found)
-            {
-                DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] interface defined by IP '%s' not found\n"), ipAddress.toString().c_str()););
-                return false;
-            }
-
-            //// done selecting the interface
-
-            if (m_netif->num == STATION_IF)
-            {
-
-                m_GotIPHandler = WiFi.onStationModeGotIP([this](const WiFiEventStationModeGotIP & pEvent)
-                {
-                    (void) pEvent;
-                    // Ensure that _restart() runs in USER context
-                    schedule_function([this]()
-                    {
-                        MDNSResponder::_restart();
-                    });
-                });
-
-                m_DisconnectedHandler = WiFi.onStationModeDisconnected([this](const WiFiEventStationModeDisconnected & pEvent)
-                {
-                    (void) pEvent;
-                    // Ensure that _restart() runs in USER context
-                    schedule_function([this]()
-                    {
-                        MDNSResponder::_restart();
-                    });
-                });
-            }
-
-            bResult = _restart();
-        }
+        bResult = ((_setHostname(p_pcHostname)) &&
+                   (_attachNetIf(p_pNetIf)) &&
+                   (_restart()));
         DEBUG_EX_ERR(if (!bResult)
     {
         DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] begin: FAILED for '%s'!\n"), (p_pcHostname ? : "-"));
         });
     }
+    else if (!p_pNetIf)
+    {
+        DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] begin: NO network interface given (Ignored host domain: '%s')!\n"), (p_pcHostname ? : "-")););
+    }
     else
     {
-        DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] begin: Ignoring multiple calls to begin (Ignored host domain: '%s')!\n"), (p_pcHostname ? : "-")););
+        DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] begin: Ignoring multiple calls (Ignored host domain: '%s')!\n"), (p_pcHostname ? : "-")););
+    }
+    return bResult;
+}
+
+/*
+    MDNSResponder::begin (hostname)
+*/
+bool MDNSResponder::begin(const char* p_pcHostname)
+{
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] begin(hostname)\n")););
+
+    return begin(p_pcHostname, (WiFiMode_t)wifi_get_opmode_default());
+}
+
+/*
+    MDNSResponder::begin (hostname, WiFiMode)
+ **/
+bool MDNSResponder::begin(const char* p_pcHostname,
+                          WiFiMode_t p_WiFiMode)
+{
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] begin(hostname, opmode)\n")););
+
+    bool bResult = false;
+
+    if ((WIFI_STA == p_WiFiMode) ||	// 1
+            (WIFI_AP == p_WiFiMode))  	// 2
+    {
+        DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] begin: WiFi mode %u\n"), (uint32_t)p_WiFiMode););
+
+        bResult = begin(p_pcHostname, netif_get_by_index(p_WiFiMode));
     }
     return bResult;
 }
@@ -216,30 +193,22 @@ bool MDNSResponder::begin(const char* p_pcHostname, const IPAddress& p_IPAddress
 bool MDNSResponder::close(void)
 {
 
-    m_GotIPHandler.reset();			// reset WiFi event callbacks.
-    m_DisconnectedHandler.reset();
-
-    _announce(false, true);
+    if (m_pUDPContext)
+    {
+        // Un-announce, if yet connected
+        _announce(false, true);
+    }
     _resetProbeStatus(false);   // Stop probing
 
-    _releaseServiceQueries();
-    _releaseUDPContext();
+    _releaseQueries();
     _releaseHostname();
+    _releaseUDPContext();
+    _detachNetIf();
+    _releaseServices();
+
+    m_pNetIf = 0;
 
     return true;
-}
-
-/*
-    MDNSResponder::end
-
-    Ends the MDNS responder.
-    for compatibility with esp32
-
-*/
-
-bool MDNSResponder::end(void)
-{
-    return close();
 }
 
 /*
@@ -257,7 +226,7 @@ bool MDNSResponder::setHostname(const char* p_pcHostname)
 
     if (_setHostname(p_pcHostname))
     {
-        m_HostProbeInformation.m_ProbingStatus = ProbingStatus_ReadyToStart;
+        m_HostProbeInformation.m_ProbingStatus = enuProbingStatus::ReadyToStart;
 
         // Replace 'auto-set' service names
         bResult = true;
@@ -266,7 +235,7 @@ bool MDNSResponder::setHostname(const char* p_pcHostname)
             if (pService->m_bAutoName)
             {
                 bResult = pService->setName(p_pcHostname);
-                pService->m_ProbeInformation.m_ProbingStatus = ProbingStatus_ReadyToStart;
+                pService->m_ProbeInformation.m_ProbingStatus = enuProbingStatus::ReadyToStart;
             }
         }
     }
@@ -286,6 +255,23 @@ bool MDNSResponder::setHostname(String p_strHostname)
     return setHostname(p_strHostname.c_str());
 }
 
+/*
+    MDNSResponder::hostname
+*/
+const char* MDNSResponder::hostname(void) const
+{
+
+    return m_pcHostname;
+}
+
+/*
+    MDNSResponder::status
+*/
+bool MDNSResponder::status(void) const
+{
+
+    return (enuProbingStatus::Done == m_HostProbeInformation.m_ProbingStatus);
+}
 
 /*
     SERVICES
@@ -321,8 +307,37 @@ MDNSResponder::hMDNSService MDNSResponder::addService(const char* p_pcName,
             if (0 != (hResult = (hMDNSService)_allocService(p_pcName, p_pcService, p_pcProtocol, p_u16Port)))
             {
 
-                // Start probing
-                ((stcMDNSService*)hResult)->m_ProbeInformation.m_ProbingStatus = ProbingStatus_ReadyToStart;
+                // Init probing
+                ((stcMDNSService*)hResult)->m_ProbeInformation.m_ProbingStatus = enuProbingStatus::ReadyToStart;
+
+                // Set default service probe result callback
+                setServiceProbeResultCallback(hResult, [this](MDNSResponder * p_pMDNSResponder, const char* p_pcServiceName, const hMDNSService p_hMDNSService, bool p_bProbeResult)
+                {
+
+                    (void)p_pMDNSResponder;
+
+                    if (false == p_bProbeResult)
+                    {
+                        // Change service name, use ' #' as divider between base name and index
+                        char*   pcServiceNameTemp = strdup(p_pcServiceName);
+                        if (pcServiceNameTemp)
+                        {
+                            if (MDNSResponder::indexDomain(pcServiceNameTemp, " #", 0))
+                            {
+                                setServiceName(p_hMDNSService, pcServiceNameTemp);
+                            }
+                            else
+                            {
+                                DEBUG_EX_ERR(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] defaultServiceProbeResultCallback: FAILED to update service name (%s)!\n"), pcServiceNameTemp););
+                            }
+                            free(pcServiceNameTemp);
+                        }
+                        else
+                        {
+                            DEBUG_EX_ERR(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] defaultServiceProbeResultCallback: FAILED to copy service name (%s)!\n"), pcServiceNameTemp););
+                        }
+                    }
+                });
             }
         }
     }   // else: bad arguments
@@ -389,13 +404,64 @@ bool MDNSResponder::setServiceName(const MDNSResponder::hMDNSService p_hService,
                         (MDNS_DOMAIN_LABEL_MAXLENGTH >= os_strlen(p_pcInstanceName))) &&
                        ((pService = _findService(p_hService))) &&
                        (pService->setName(p_pcInstanceName)) &&
-                       ((pService->m_ProbeInformation.m_ProbingStatus = ProbingStatus_ReadyToStart)));
+                       ((pService->m_ProbeInformation.m_ProbingStatus = enuProbingStatus::ReadyToStart), true));
     DEBUG_EX_ERR(if (!bResult)
 {
     DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] setServiceName: FAILED for '%s'!\n"), (p_pcInstanceName ? : "-"));
     });
     return bResult;
 }
+
+/*
+    MDNSResponder::serviceName
+*/
+const char* MDNSResponder::serviceName(const hMDNSService p_hService) const
+{
+
+    const stcMDNSService* pService = 0;
+    return (((pService = _findService(p_hService)))
+            ? pService->m_pcName
+            : 0);
+}
+
+/*
+    MDNSResponder::service
+*/
+const char* MDNSResponder::service(const hMDNSService p_hService) const
+{
+
+    const stcMDNSService* pService = 0;
+    return (((pService = _findService(p_hService)))
+            ? pService->m_pcService
+            : 0);
+}
+
+/*
+    MDNSResponder::serviceProtocol
+*/
+const char* MDNSResponder::serviceProtocol(const hMDNSService p_hService) const
+{
+
+    const stcMDNSService* pService = 0;
+    return (((pService = _findService(p_hService)))
+            ? pService->m_pcProtocol
+            : 0);
+}
+
+/*
+    MDNSResponder::serviceStatus
+
+    Returns 'true' if probing for the serive 'hMDNSService' is done
+
+*/
+bool MDNSResponder::serviceStatus(const hMDNSService p_hService) const
+{
+
+    const stcMDNSService* pService = 0;
+    return (((pService = _findService(p_hService))) &&
+            (enuProbingStatus::Done == pService->m_ProbeInformation.m_ProbingStatus));
+}
+
 
 /*
     SERVICE TXT
@@ -611,7 +677,7 @@ bool MDNSResponder::addServiceTxt(String p_strService,
     service TXT items are needed.
 
 */
-bool MDNSResponder::setDynamicServiceTxtCallback(MDNSResponder::MDNSDynamicServiceTxtCallbackFunc p_fnCallback)
+bool MDNSResponder::setDynamicServiceTxtCallback(MDNSResponder::MDNSDynamicServiceTxtCallbackFn p_fnCallback)
 {
 
     m_fnServiceTxtCallback = p_fnCallback;
@@ -627,7 +693,7 @@ bool MDNSResponder::setDynamicServiceTxtCallback(MDNSResponder::MDNSDynamicServi
 
 */
 bool MDNSResponder::setDynamicServiceTxtCallback(MDNSResponder::hMDNSService p_hService,
-        MDNSResponder::MDNSDynamicServiceTxtCallbackFunc p_fnCallback)
+        MDNSResponder::MDNSDynamicServiceTxtCallbackFn p_fnCallback)
 {
 
     bool    bResult = false;
@@ -755,7 +821,7 @@ MDNSResponder::hMDNSTxt MDNSResponder::addDynamicServiceTxt(MDNSResponder::hMDNS
 
 
 /**
-    STATIC SERVICE QUERY (LEGACY)
+    STATIC QUERIES (LEGACY)
 */
 
 /*
@@ -776,32 +842,32 @@ uint32_t MDNSResponder::queryService(const char* p_pcService,
 
     uint32_t    u32Result = 0;
 
-    stcMDNSServiceQuery*    pServiceQuery = 0;
+    stcMDNSQuery*    pQueryQuery = 0;
     if ((p_pcService) &&
             (os_strlen(p_pcService)) &&
             (p_pcProtocol) &&
             (os_strlen(p_pcProtocol)) &&
             (p_u16Timeout) &&
-            (_removeLegacyServiceQuery()) &&
-            ((pServiceQuery = _allocServiceQuery())) &&
-            (_buildDomainForService(p_pcService, p_pcProtocol, pServiceQuery->m_ServiceTypeDomain)))
+            (_removeLegacyQuery()) &&
+            ((pQueryQuery = _allocQuery(stcMDNSQuery::enuQueryType::Service))) &&
+            (_buildDomainForService(p_pcService, p_pcProtocol, pQueryQuery->m_Domain)))
     {
 
-        pServiceQuery->m_bLegacyQuery = true;
+        pQueryQuery->m_bLegacyQuery = true;
 
-        if (_sendMDNSServiceQuery(*pServiceQuery))
+        if (_sendMDNSQuery(*pQueryQuery))
         {
             // Wait for answers to arrive
             DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] queryService: Waiting %u ms for answers...\n"), p_u16Timeout););
             delay(p_u16Timeout);
 
             // All answers should have arrived by now -> stop adding new answers
-            pServiceQuery->m_bAwaitingAnswers = false;
-            u32Result = pServiceQuery->answerCount();
+            pQueryQuery->m_bAwaitingAnswers = false;
+            u32Result = pQueryQuery->answerCount();
         }
         else    // FAILED to send query
         {
-            _removeServiceQuery(pServiceQuery);
+            _removeQuery(pQueryQuery);
         }
     }
     else
@@ -809,18 +875,6 @@ uint32_t MDNSResponder::queryService(const char* p_pcService,
         DEBUG_EX_ERR(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] queryService: INVALID input data!\n")););
     }
     return u32Result;
-}
-
-/*
-    MDNSResponder::removeQuery
-
-    Remove the last static service query (and all answers).
-
-*/
-bool MDNSResponder::removeQuery(void)
-{
-
-    return _removeLegacyServiceQuery();
 }
 
 /*
@@ -834,13 +888,99 @@ uint32_t MDNSResponder::queryService(String p_strService,
 }
 
 /*
+    MDNSResponder::queryHost
+
+    Perform a (blocking) static host query.
+    The arrived answers can be queried by calling:
+    - answerHostname (or 'hostname')
+    - answerIP (or 'IP')
+    - answerPort (or 'port')
+
+*/
+uint32_t MDNSResponder::queryHost(const char* p_pcHostname,
+                                  const uint16_t p_u16Timeout /*= MDNS_QUERYSERVICES_WAIT_TIME*/)
+{
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] queryHost '%s.local'\n"), p_pcHostname););
+
+    uint32_t    u32Result = 0;
+
+    stcMDNSQuery*    pHostQuery = 0;
+    if ((p_pcHostname) &&
+            (os_strlen(p_pcHostname)) &&
+            (p_u16Timeout) &&
+            (_removeLegacyQuery()) &&
+            ((pHostQuery = _allocQuery(stcMDNSQuery::enuQueryType::Host))) &&
+            (_buildDomainForHost(p_pcHostname, pHostQuery->m_Domain)))
+    {
+
+        pHostQuery->m_bLegacyQuery = true;
+
+        if (_sendMDNSQuery(*pHostQuery))
+        {
+            // Wait for answers to arrive
+            DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] queryHost: Waiting %u ms for answers...\n"), p_u16Timeout););
+            delay(p_u16Timeout);
+
+            // All answers should have arrived by now -> stop adding new answers
+            pHostQuery->m_bAwaitingAnswers = false;
+            u32Result = pHostQuery->answerCount();
+        }
+        else    // FAILED to send query
+        {
+            _removeQuery(pHostQuery);
+        }
+    }
+    else
+    {
+        DEBUG_EX_ERR(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] queryHost: INVALID input data!\n")););
+    }
+    return u32Result;
+}
+
+/*
+    MDNSResponder::removeQuery
+
+    Remove the last static query (and all answers).
+
+*/
+bool MDNSResponder::removeQuery(void)
+{
+
+    return _removeLegacyQuery();
+}
+
+/*
+    MDNSResponder::hasQuery
+
+    Return 'true', if a static query is currently installed
+
+*/
+bool MDNSResponder::hasQuery(void)
+{
+
+    return (0 != _findLegacyQuery());
+}
+
+/*
+    MDNSResponder::getQuery
+
+    Return handle to the last static query
+
+*/
+MDNSResponder::hMDNSQuery MDNSResponder::getQuery(void)
+{
+
+    return ((hMDNSQuery)_findLegacyQuery());
+}
+
+/*
     MDNSResponder::answerHostname
 */
 const char* MDNSResponder::answerHostname(const uint32_t p_u32AnswerIndex)
 {
 
-    stcMDNSServiceQuery*            pServiceQuery = _findLegacyServiceQuery();
-    stcMDNSServiceQuery::stcAnswer* pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    stcMDNSQuery*            pQuery = _findLegacyQuery();
+    stcMDNSQuery::stcAnswer* pSQAnswer = (pQuery ? pQuery->answerAtIndex(p_u32AnswerIndex) : 0);
 
     if ((pSQAnswer) &&
             (pSQAnswer->m_HostDomain.m_u16NameLength) &&
@@ -856,31 +996,40 @@ const char* MDNSResponder::answerHostname(const uint32_t p_u32AnswerIndex)
     return (pSQAnswer ? pSQAnswer->m_pcHostDomain : 0);
 }
 
-#ifdef MDNS_IP4_SUPPORT
+#ifdef MDNS_IPV4_SUPPORT
+/*
+    MDNSResponder::answerIPv4
+*/
+IPAddress MDNSResponder::answerIPv4(const uint32_t p_u32AnswerIndex)
+{
+
+    const stcMDNSQuery*                              pQuery = _findLegacyQuery();
+    const stcMDNSQuery::stcAnswer*                   pSQAnswer = (pQuery ? pQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    const stcMDNSQuery::stcAnswer::stcIPv4Address*   pIPv4Address = (((pSQAnswer) && (pSQAnswer->m_pIPv4Addresses)) ? pSQAnswer->IPv4AddressAtIndex(0) : 0);
+    return (pIPv4Address ? pIPv4Address->m_IPAddress : IPAddress());
+}
+
 /*
     MDNSResponder::answerIP
 */
 IPAddress MDNSResponder::answerIP(const uint32_t p_u32AnswerIndex)
 {
 
-    const stcMDNSServiceQuery*                              pServiceQuery = _findLegacyServiceQuery();
-    const stcMDNSServiceQuery::stcAnswer*                   pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
-    const stcMDNSServiceQuery::stcAnswer::stcIP4Address*    pIP4Address = (((pSQAnswer) && (pSQAnswer->m_pIP4Addresses)) ? pSQAnswer->IP4AddressAtIndex(0) : 0);
-    return (pIP4Address ? pIP4Address->m_IPAddress : IPAddress());
+    return answerIPv4(p_u32AnswerIndex);
 }
 #endif
 
-#ifdef MDNS_IP6_SUPPORT
+#ifdef MDNS_IPV6_SUPPORT
 /*
-    MDNSResponder::answerIP6
+    MDNSResponder::answerIPv6
 */
-IPAddress MDNSResponder::answerIP6(const uint32_t p_u32AnswerIndex)
+IPAddress MDNSResponder::answerIPv6(const uint32_t p_u32AnswerIndex)
 {
 
-    const stcMDNSServiceQuery*                              pServiceQuery = _findLegacyServiceQuery();
-    const stcMDNSServiceQuery::stcAnswer*                   pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
-    const stcMDNSServiceQuery::stcAnswer::stcIP6Address*    pIP6Address = (((pSQAnswer) && (pSQAnswer->m_pIP6Addresses)) ? pSQAnswer->IP6AddressAtIndex(0) : 0);
-    return (pIP6Address ? pIP6Address->m_IPAddress : IP6Address());
+    const stcMDNSQuery*                              pQuery = _findLegacyQuery();
+    const stcMDNSQuery::stcAnswer*                   pSQAnswer = (pQuery ? pQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    const stcMDNSQuery::stcAnswer::stcIPv6Address*	pIPv6Address = (((pSQAnswer) && (pSQAnswer->m_pIPv6Addresses)) ? pSQAnswer->IPv6AddressAtIndex(0) : 0);
+    return (pIPv6Address ? pIPv6Address->m_IPAddress : IPAddress());
 }
 #endif
 
@@ -890,8 +1039,8 @@ IPAddress MDNSResponder::answerIP6(const uint32_t p_u32AnswerIndex)
 uint16_t MDNSResponder::answerPort(const uint32_t p_u32AnswerIndex)
 {
 
-    const stcMDNSServiceQuery*              pServiceQuery = _findLegacyServiceQuery();
-    const stcMDNSServiceQuery::stcAnswer*   pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    const stcMDNSQuery*              pQuery = _findLegacyQuery();
+    const stcMDNSQuery::stcAnswer*   pSQAnswer = (pQuery ? pQuery->answerAtIndex(p_u32AnswerIndex) : 0);
     return (pSQAnswer ? pSQAnswer->m_u16Port : 0);
 }
 
@@ -904,6 +1053,7 @@ String MDNSResponder::hostname(const uint32_t p_u32AnswerIndex)
     return String(answerHostname(p_u32AnswerIndex));
 }
 
+#ifdef MDNS_IPV4_SUPPORT
 /*
     MDNSResponder::IP (LEGACY)
 */
@@ -912,6 +1062,7 @@ IPAddress MDNSResponder::IP(const uint32_t p_u32AnswerIndex)
 
     return answerIP(p_u32AnswerIndex);
 }
+#endif
 
 /*
     MDNSResponder::port (LEGACY)
@@ -935,40 +1086,40 @@ uint16_t MDNSResponder::port(const uint32_t p_u32AnswerIndex)
     The answers can also be queried by calling:
     - answerServiceDomain
     - answerHostDomain
-    - answerIP4Address/answerIP6Address
+    - answerIPv4Address/answerIPv6Address
     - answerPort
     - answerTxts
 
 */
-MDNSResponder::hMDNSServiceQuery MDNSResponder::installServiceQuery(const char* p_pcService,
+MDNSResponder::hMDNSQuery MDNSResponder::installServiceQuery(const char* p_pcService,
         const char* p_pcProtocol,
-        MDNSResponder::MDNSServiceQueryCallbackFunc p_fnCallback)
+        MDNSResponder::MDNSQueryCallbackFn p_fnCallback)
 {
-    hMDNSServiceQuery       hResult = 0;
+    hMDNSQuery      hResult = 0;
 
-    stcMDNSServiceQuery*    pServiceQuery = 0;
+    stcMDNSQuery*   pQueryQuery = 0;
     if ((p_pcService) &&
             (os_strlen(p_pcService)) &&
             (p_pcProtocol) &&
             (os_strlen(p_pcProtocol)) &&
             (p_fnCallback) &&
-            ((pServiceQuery = _allocServiceQuery())) &&
-            (_buildDomainForService(p_pcService, p_pcProtocol, pServiceQuery->m_ServiceTypeDomain)))
+            ((pQueryQuery = _allocQuery(stcMDNSQuery::enuQueryType::Service))) &&
+            (_buildDomainForService(p_pcService, p_pcProtocol, pQueryQuery->m_Domain)))
     {
 
-        pServiceQuery->m_fnCallback = p_fnCallback;
-        pServiceQuery->m_bLegacyQuery = false;
+        pQueryQuery->m_fnCallback = p_fnCallback;
+        pQueryQuery->m_bLegacyQuery = false;
 
-        if (_sendMDNSServiceQuery(*pServiceQuery))
+        if (_sendMDNSQuery(*pQueryQuery))
         {
-            pServiceQuery->m_u8SentCount = 1;
-            pServiceQuery->m_ResendTimeout.reset(MDNS_DYNAMIC_QUERY_RESEND_DELAY);
+            pQueryQuery->m_u8SentCount = 1;
+            pQueryQuery->m_ResendTimeout.reset(MDNS_DYNAMIC_QUERY_RESEND_DELAY);
 
-            hResult = (hMDNSServiceQuery)pServiceQuery;
+            hResult = (hMDNSQuery)pQueryQuery;
         }
         else
         {
-            _removeServiceQuery(pServiceQuery);
+            _removeQuery(pQueryQuery);
         }
     }
     DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] installServiceQuery: %s for '%s.%s'!\n\n"), (hResult ? "Succeeded" : "FAILED"), (p_pcService ? : "-"), (p_pcProtocol ? : "-")););
@@ -980,20 +1131,45 @@ MDNSResponder::hMDNSServiceQuery MDNSResponder::installServiceQuery(const char* 
 }
 
 /*
-    MDNSResponder::removeServiceQuery
+    MDNSResponder::installHostQuery
+*/
+MDNSResponder::hMDNSQuery MDNSResponder::installHostQuery(const char* p_pcHostname,
+        MDNSResponder::MDNSQueryCallbackFn p_fnCallback)
+{
+    hMDNSQuery       hResult = 0;
 
-    Remove a dynamic service query (and all collected answers) from the MDNS responder
+    if ((p_pcHostname) &&
+            (os_strlen(p_pcHostname)))
+    {
+
+        stcMDNS_RRDomain    domain;
+        hResult = ((_buildDomainForHost(p_pcHostname, domain))
+                   ? _installDomainQuery(domain, stcMDNSQuery::enuQueryType::Host, p_fnCallback)
+                   : 0);
+    }
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] installHostQuery: %s for '%s.local'!\n\n"), (hResult ? "Succeeded" : "FAILED"), (p_pcHostname ? : "-")););
+    DEBUG_EX_ERR(if (!hResult)
+{
+    DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] installHostQuery: FAILED for '%s.local'!\n\n"), (p_pcHostname ? : "-"));
+    });
+    return hResult;
+}
+
+/*
+    MDNSResponder::removeQuery
+
+    Remove a dynamic query (and all collected answers) from the MDNS responder
 
 */
-bool MDNSResponder::removeServiceQuery(MDNSResponder::hMDNSServiceQuery p_hServiceQuery)
+bool MDNSResponder::removeQuery(MDNSResponder::hMDNSQuery p_hQuery)
 {
 
-    stcMDNSServiceQuery*    pServiceQuery = 0;
-    bool    bResult = (((pServiceQuery = _findServiceQuery(p_hServiceQuery))) &&
-                       (_removeServiceQuery(pServiceQuery)));
+    stcMDNSQuery*    pQueryQuery = 0;
+    bool    bResult = (((pQueryQuery = _findQuery(p_hQuery))) &&
+                       (_removeQuery(pQueryQuery)));
     DEBUG_EX_ERR(if (!bResult)
 {
-    DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] removeServiceQuery: FAILED!\n"));
+    DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] removeQuery: FAILED!\n"));
     });
     return bResult;
 }
@@ -1001,21 +1177,38 @@ bool MDNSResponder::removeServiceQuery(MDNSResponder::hMDNSServiceQuery p_hServi
 /*
     MDNSResponder::answerCount
 */
-uint32_t MDNSResponder::answerCount(const MDNSResponder::hMDNSServiceQuery p_hServiceQuery)
+uint32_t MDNSResponder::answerCount(const MDNSResponder::hMDNSQuery p_hServiceQuery)
 {
 
-    stcMDNSServiceQuery*    pServiceQuery = _findServiceQuery(p_hServiceQuery);
-    return (pServiceQuery ? pServiceQuery->answerCount() : 0);
+    stcMDNSQuery*    pQueryQuery = _findQuery(p_hServiceQuery);
+    return (pQueryQuery ? pQueryQuery->answerCount() : 0);
 }
 
-std::vector<MDNSResponder::MDNSServiceInfo>  MDNSResponder::answerInfo(const MDNSResponder::hMDNSServiceQuery p_hServiceQuery)
+/*
+    MDNSResponder::answerAccessors
+*/
+MDNSResponder::clsMDNSAnswerAccessorVector MDNSResponder::answerAccessors(const MDNSResponder::hMDNSQuery p_hServiceQuery)
 {
-    std::vector<MDNSResponder::MDNSServiceInfo> tempVector;
-    for (uint32_t i = 0; i < answerCount(p_hServiceQuery); i++)
+
+    MDNSResponder::clsMDNSAnswerAccessorVector  tempVector;
+    for (uint32_t u = 0; u < answerCount(p_hServiceQuery); ++u)
     {
-        tempVector.emplace_back(*this, p_hServiceQuery, i);
+        tempVector.emplace_back(*this, p_hServiceQuery, u);
     }
     return tempVector;
+}
+
+/*
+    MDNSResponder::hasAnswerServiceDomain
+*/
+bool MDNSResponder::hasAnswerServiceDomain(const MDNSResponder::hMDNSQuery p_hServiceQuery,
+        const uint32_t p_u32AnswerIndex)
+{
+
+    stcMDNSQuery*            pQueryQuery = _findQuery(p_hServiceQuery);
+    stcMDNSQuery::stcAnswer* pSQAnswer = (pQueryQuery ? pQueryQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    return ((pSQAnswer) &&
+            (pSQAnswer->m_QueryAnswerFlags & static_cast<typeQueryAnswerType>(enuQueryAnswerType::ServiceDomain)));
 }
 
 /*
@@ -1025,12 +1218,12 @@ std::vector<MDNSResponder::MDNSServiceInfo>  MDNSResponder::answerInfo(const MDN
     If not already existing, the string is allocated, filled and attached to the answer.
 
 */
-const char* MDNSResponder::answerServiceDomain(const MDNSResponder::hMDNSServiceQuery p_hServiceQuery,
+const char* MDNSResponder::answerServiceDomain(const MDNSResponder::hMDNSQuery p_hServiceQuery,
         const uint32_t p_u32AnswerIndex)
 {
 
-    stcMDNSServiceQuery*            pServiceQuery = _findServiceQuery(p_hServiceQuery);
-    stcMDNSServiceQuery::stcAnswer* pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    stcMDNSQuery*            pQueryQuery = _findQuery(p_hServiceQuery);
+    stcMDNSQuery::stcAnswer* pSQAnswer = (pQueryQuery ? pQueryQuery->answerAtIndex(p_u32AnswerIndex) : 0);
     // Fill m_pcServiceDomain (if not already done)
     if ((pSQAnswer) &&
             (pSQAnswer->m_ServiceDomain.m_u16NameLength) &&
@@ -1049,14 +1242,14 @@ const char* MDNSResponder::answerServiceDomain(const MDNSResponder::hMDNSService
 /*
     MDNSResponder::hasAnswerHostDomain
 */
-bool MDNSResponder::hasAnswerHostDomain(const MDNSResponder::hMDNSServiceQuery p_hServiceQuery,
+bool MDNSResponder::hasAnswerHostDomain(const MDNSResponder::hMDNSQuery p_hServiceQuery,
                                         const uint32_t p_u32AnswerIndex)
 {
 
-    stcMDNSServiceQuery*            pServiceQuery = _findServiceQuery(p_hServiceQuery);
-    stcMDNSServiceQuery::stcAnswer* pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    stcMDNSQuery*            pQueryQuery = _findQuery(p_hServiceQuery);
+    stcMDNSQuery::stcAnswer* pSQAnswer = (pQueryQuery ? pQueryQuery->answerAtIndex(p_u32AnswerIndex) : 0);
     return ((pSQAnswer) &&
-            (pSQAnswer->m_u32ContentFlags & ServiceQueryAnswerType_HostDomainAndPort));
+            (pSQAnswer->m_QueryAnswerFlags & static_cast<typeQueryAnswerType>(enuQueryAnswerType::HostDomain)));
 }
 
 /*
@@ -1066,12 +1259,12 @@ bool MDNSResponder::hasAnswerHostDomain(const MDNSResponder::hMDNSServiceQuery p
     If not already existing, the string is allocated, filled and attached to the answer.
 
 */
-const char* MDNSResponder::answerHostDomain(const MDNSResponder::hMDNSServiceQuery p_hServiceQuery,
+const char* MDNSResponder::answerHostDomain(const MDNSResponder::hMDNSQuery p_hServiceQuery,
         const uint32_t p_u32AnswerIndex)
 {
 
-    stcMDNSServiceQuery*            pServiceQuery = _findServiceQuery(p_hServiceQuery);
-    stcMDNSServiceQuery::stcAnswer* pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    stcMDNSQuery*            pQueryQuery = _findQuery(p_hServiceQuery);
+    stcMDNSQuery::stcAnswer* pSQAnswer = (pQueryQuery ? pQueryQuery->answerAtIndex(p_u32AnswerIndex) : 0);
     // Fill m_pcHostDomain (if not already done)
     if ((pSQAnswer) &&
             (pSQAnswer->m_HostDomain.m_u16NameLength) &&
@@ -1087,124 +1280,124 @@ const char* MDNSResponder::answerHostDomain(const MDNSResponder::hMDNSServiceQue
     return (pSQAnswer ? pSQAnswer->m_pcHostDomain : 0);
 }
 
-#ifdef MDNS_IP4_SUPPORT
+#ifdef MDNS_IPV4_SUPPORT
 /*
-    MDNSResponder::hasAnswerIP4Address
+    MDNSResponder::hasAnswerIPv4Address
 */
-bool MDNSResponder::hasAnswerIP4Address(const MDNSResponder::hMDNSServiceQuery p_hServiceQuery,
-                                        const uint32_t p_u32AnswerIndex)
-{
-
-    stcMDNSServiceQuery*            pServiceQuery = _findServiceQuery(p_hServiceQuery);
-    stcMDNSServiceQuery::stcAnswer* pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
-    return ((pSQAnswer) &&
-            (pSQAnswer->m_u32ContentFlags & ServiceQueryAnswerType_IP4Address));
-}
-
-/*
-    MDNSResponder::answerIP4AddressCount
-*/
-uint32_t MDNSResponder::answerIP4AddressCount(const MDNSResponder::hMDNSServiceQuery p_hServiceQuery,
+bool MDNSResponder::hasAnswerIPv4Address(const MDNSResponder::hMDNSQuery p_hServiceQuery,
         const uint32_t p_u32AnswerIndex)
 {
 
-    stcMDNSServiceQuery*            pServiceQuery = _findServiceQuery(p_hServiceQuery);
-    stcMDNSServiceQuery::stcAnswer* pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
-    return (pSQAnswer ? pSQAnswer->IP4AddressCount() : 0);
+    stcMDNSQuery*            pQueryQuery = _findQuery(p_hServiceQuery);
+    stcMDNSQuery::stcAnswer* pSQAnswer = (pQueryQuery ? pQueryQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    return ((pSQAnswer) &&
+            (pSQAnswer->m_QueryAnswerFlags & static_cast<typeQueryAnswerType>(enuQueryAnswerType::IPv4Address)));
 }
 
 /*
-    MDNSResponder::answerIP4Address
+    MDNSResponder::answerIPv4AddressCount
 */
-IPAddress MDNSResponder::answerIP4Address(const MDNSResponder::hMDNSServiceQuery p_hServiceQuery,
+uint32_t MDNSResponder::answerIPv4AddressCount(const MDNSResponder::hMDNSQuery p_hServiceQuery,
+        const uint32_t p_u32AnswerIndex)
+{
+
+    stcMDNSQuery*            pQueryQuery = _findQuery(p_hServiceQuery);
+    stcMDNSQuery::stcAnswer* pSQAnswer = (pQueryQuery ? pQueryQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    return (pSQAnswer ? pSQAnswer->IPv4AddressCount() : 0);
+}
+
+/*
+    MDNSResponder::answerIPv4Address
+*/
+IPAddress MDNSResponder::answerIPv4Address(const MDNSResponder::hMDNSQuery p_hServiceQuery,
         const uint32_t p_u32AnswerIndex,
         const uint32_t p_u32AddressIndex)
 {
 
-    stcMDNSServiceQuery*                            pServiceQuery = _findServiceQuery(p_hServiceQuery);
-    stcMDNSServiceQuery::stcAnswer*                 pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
-    stcMDNSServiceQuery::stcAnswer::stcIP4Address*  pIP4Address = (pSQAnswer ? pSQAnswer->IP4AddressAtIndex(p_u32AddressIndex) : 0);
-    return (pIP4Address ? pIP4Address->m_IPAddress : IPAddress());
+    stcMDNSQuery*                        	pQueryQuery = _findQuery(p_hServiceQuery);
+    stcMDNSQuery::stcAnswer*                 pSQAnswer = (pQueryQuery ? pQueryQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    stcMDNSQuery::stcAnswer::stcIPv4Address* pIPv4Address = (pSQAnswer ? pSQAnswer->IPv4AddressAtIndex(p_u32AddressIndex) : 0);
+    return (pIPv4Address ? pIPv4Address->m_IPAddress : IPAddress());
 }
 #endif
 
-#ifdef MDNS_IP6_SUPPORT
+#ifdef MDNS_IPV6_SUPPORT
 /*
-    MDNSResponder::hasAnswerIP6Address
+    MDNSResponder::hasAnswerIPv6Address
 */
-bool MDNSResponder::hasAnswerIP6Address(const MDNSResponder::hMDNSServiceQuery p_hServiceQuery,
-                                        const uint32_t p_u32AnswerIndex)
-{
-
-    stcMDNSServiceQuery*            pServiceQuery = _findServiceQuery(p_hServiceQuery);
-    stcMDNSServiceQuery::stcAnswer* pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
-    return ((pSQAnswer) &&
-            (pSQAnswer->m_u32ContentFlags & ServiceQueryAnswerType_HostIP6Address));
-}
-
-/*
-    MDNSResponder::answerIP6AddressCount
-*/
-uint32_t MDNSResponder::answerIP6AddressCount(const MDNSResponder::hMDNSServiceQuery p_hServiceQuery,
+bool MDNSResponder::hasAnswerIPv6Address(const MDNSResponder::hMDNSQuery p_hServiceQuery,
         const uint32_t p_u32AnswerIndex)
 {
 
-    stcMDNSServiceQuery*            pServiceQuery = _findServiceQuery(p_hServiceQuery);
-    stcMDNSServiceQuery::stcAnswer* pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
-    return (pSQAnswer ? pSQAnswer->IP6AddressCount() : 0);
+    stcMDNSQuery*            pQueryQuery = _findQuery(p_hServiceQuery);
+    stcMDNSQuery::stcAnswer* pSQAnswer = (pQueryQuery ? pQueryQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    return ((pSQAnswer) &&
+            (pSQAnswer->m_QueryAnswerFlags & static_cast<typeQueryAnswerType>(enuQueryAnswerType::IPv6Address)));
 }
 
 /*
-    MDNSResponder::answerIP6Address
+    MDNSResponder::answerIPv6AddressCount
 */
-IPAddress MDNSResponder::answerIP6Address(const MDNSResponder::hMDNSServiceQuery p_hServiceQuery,
+uint32_t MDNSResponder::answerIPv6AddressCount(const MDNSResponder::hMDNSQuery p_hServiceQuery,
+        const uint32_t p_u32AnswerIndex)
+{
+
+    stcMDNSQuery*            pQueryQuery = _findQuery(p_hServiceQuery);
+    stcMDNSQuery::stcAnswer* pSQAnswer = (pQueryQuery ? pQueryQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    return (pSQAnswer ? pSQAnswer->IPv6AddressCount() : 0);
+}
+
+/*
+    MDNSResponder::answerIPv6Address
+*/
+IPAddress MDNSResponder::answerIPv6Address(const MDNSResponder::hMDNSQuery p_hServiceQuery,
         const uint32_t p_u32AnswerIndex,
         const uint32_t p_u32AddressIndex)
 {
 
-    stcMDNSServiceQuery*                            pServiceQuery = _findServiceQuery(p_hServiceQuery);
-    stcMDNSServiceQuery::stcAnswer*                 pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
-    stcMDNSServiceQuery::stcAnswer::stcIP6Address*  pIP6Address = (pSQAnswer ? pSQAnswer->IP6AddressAtIndex(p_u32AddressIndex) : 0);
-    return (pIP6Address ? pIP6Address->m_IPAddress : IPAddress());
+    stcMDNSQuery*                            pQueryQuery = _findQuery(p_hServiceQuery);
+    stcMDNSQuery::stcAnswer*                 pSQAnswer = (pQueryQuery ? pQueryQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    stcMDNSQuery::stcAnswer::stcIPv6Address*  pIPv6Address = (pSQAnswer ? pSQAnswer->IPv6AddressAtIndex(p_u32AddressIndex) : 0);
+    return (pIPv6Address ? pIPv6Address->m_IPAddress : IPAddress());
 }
 #endif
 
 /*
     MDNSResponder::hasAnswerPort
 */
-bool MDNSResponder::hasAnswerPort(const MDNSResponder::hMDNSServiceQuery p_hServiceQuery,
+bool MDNSResponder::hasAnswerPort(const MDNSResponder::hMDNSQuery p_hServiceQuery,
                                   const uint32_t p_u32AnswerIndex)
 {
 
-    stcMDNSServiceQuery*            pServiceQuery = _findServiceQuery(p_hServiceQuery);
-    stcMDNSServiceQuery::stcAnswer* pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    stcMDNSQuery*            pQueryQuery = _findQuery(p_hServiceQuery);
+    stcMDNSQuery::stcAnswer* pSQAnswer = (pQueryQuery ? pQueryQuery->answerAtIndex(p_u32AnswerIndex) : 0);
     return ((pSQAnswer) &&
-            (pSQAnswer->m_u32ContentFlags & ServiceQueryAnswerType_HostDomainAndPort));
+            (pSQAnswer->m_QueryAnswerFlags & static_cast<typeQueryAnswerType>(enuQueryAnswerType::Port)));
 }
 
 /*
     MDNSResponder::answerPort
 */
-uint16_t MDNSResponder::answerPort(const MDNSResponder::hMDNSServiceQuery p_hServiceQuery,
+uint16_t MDNSResponder::answerPort(const MDNSResponder::hMDNSQuery p_hServiceQuery,
                                    const uint32_t p_u32AnswerIndex)
 {
 
-    stcMDNSServiceQuery*            pServiceQuery = _findServiceQuery(p_hServiceQuery);
-    stcMDNSServiceQuery::stcAnswer* pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    stcMDNSQuery*            pQueryQuery = _findQuery(p_hServiceQuery);
+    stcMDNSQuery::stcAnswer* pSQAnswer = (pQueryQuery ? pQueryQuery->answerAtIndex(p_u32AnswerIndex) : 0);
     return (pSQAnswer ? pSQAnswer->m_u16Port : 0);
 }
 
 /*
     MDNSResponder::hasAnswerTxts
 */
-bool MDNSResponder::hasAnswerTxts(const MDNSResponder::hMDNSServiceQuery p_hServiceQuery,
+bool MDNSResponder::hasAnswerTxts(const MDNSResponder::hMDNSQuery p_hServiceQuery,
                                   const uint32_t p_u32AnswerIndex)
 {
 
-    stcMDNSServiceQuery*            pServiceQuery = _findServiceQuery(p_hServiceQuery);
-    stcMDNSServiceQuery::stcAnswer* pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    stcMDNSQuery*            pQueryQuery = _findQuery(p_hServiceQuery);
+    stcMDNSQuery::stcAnswer* pSQAnswer = (pQueryQuery ? pQueryQuery->answerAtIndex(p_u32AnswerIndex) : 0);
     return ((pSQAnswer) &&
-            (pSQAnswer->m_u32ContentFlags & ServiceQueryAnswerType_Txts));
+            (pSQAnswer->m_QueryAnswerFlags & static_cast<typeQueryAnswerType>(enuQueryAnswerType::Txts)));
 }
 
 /*
@@ -1214,12 +1407,12 @@ bool MDNSResponder::hasAnswerTxts(const MDNSResponder::hMDNSServiceQuery p_hServ
     If not already existing; the string is alloced, filled and attached to the answer.
 
 */
-const char* MDNSResponder::answerTxts(const MDNSResponder::hMDNSServiceQuery p_hServiceQuery,
+const char* MDNSResponder::answerTxts(const MDNSResponder::hMDNSQuery p_hServiceQuery,
                                       const uint32_t p_u32AnswerIndex)
 {
 
-    stcMDNSServiceQuery*            pServiceQuery = _findServiceQuery(p_hServiceQuery);
-    stcMDNSServiceQuery::stcAnswer* pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    stcMDNSQuery*            pQueryQuery = _findQuery(p_hServiceQuery);
+    stcMDNSQuery::stcAnswer* pSQAnswer = (pQueryQuery ? pQueryQuery->answerAtIndex(p_u32AnswerIndex) : 0);
     // Fill m_pcTxts (if not already done)
     if ((pSQAnswer) &&
             (pSQAnswer->m_Txts.m_pTxts) &&
@@ -1235,35 +1428,26 @@ const char* MDNSResponder::answerTxts(const MDNSResponder::hMDNSServiceQuery p_h
     return (pSQAnswer ? pSQAnswer->m_pcTxts : 0);
 }
 
+
 /*
     PROBING
 */
 
 /*
-    MDNSResponder::setProbeResultCallback
+    MDNSResponder::setHostProbeResultCallback
 
-    Set a global callback for probe results. The callback is called, when probing
-    for the host domain (or a service domain, without specific probe result callback)
-    failes or succeedes.
-    In the case of failure, the domain name should be changed via 'setHostname' or 'setServiceName'.
-    When succeeded, the host or service domain will be announced by the MDNS responder.
+    Set a callback for probe results. The callback is called, when probing
+    for the host domain failes or succeedes.
+    In the case of failure, the domain name should be changed via 'setHostname'
+    When succeeded, the host domain will be announced by the MDNS responder.
 
 */
-bool MDNSResponder::setHostProbeResultCallback(MDNSResponder::MDNSHostProbeFn p_fnCallback)
+bool MDNSResponder::setHostProbeResultCallback(MDNSResponder::MDNSHostProbeResultCallbackFn p_fnCallback)
 {
 
-    m_HostProbeInformation.m_fnHostProbeResultCallback = p_fnCallback;
+    m_HostProbeInformation.m_fnProbeResultCallback = p_fnCallback;
 
     return true;
-}
-
-bool MDNSResponder::setHostProbeResultCallback(MDNSHostProbeFn1 pfn)
-{
-    using namespace std::placeholders;
-    return setHostProbeResultCallback([this, pfn](const char* p_pcDomainName, bool p_bProbeResult)
-    {
-        pfn(*this, p_pcDomainName, p_bProbeResult);
-    });
 }
 
 /*
@@ -1276,29 +1460,18 @@ bool MDNSResponder::setHostProbeResultCallback(MDNSHostProbeFn1 pfn)
 
 */
 bool MDNSResponder::setServiceProbeResultCallback(const MDNSResponder::hMDNSService p_hService,
-        MDNSResponder::MDNSServiceProbeFn p_fnCallback)
+        MDNSResponder::MDNSServiceProbeResultCallbackFn p_fnCallback)
 {
-
     bool    bResult = false;
 
     stcMDNSService* pService = _findService(p_hService);
     if (pService)
     {
-        pService->m_ProbeInformation.m_fnServiceProbeResultCallback = p_fnCallback;
+        pService->m_ProbeInformation.m_fnProbeResultCallback = p_fnCallback;
 
         bResult = true;
     }
     return bResult;
-}
-
-bool MDNSResponder::setServiceProbeResultCallback(const MDNSResponder::hMDNSService p_hService,
-        MDNSResponder::MDNSServiceProbeFn1 p_fnCallback)
-{
-    using namespace std::placeholders;
-    return setServiceProbeResultCallback(p_hService, [this, p_fnCallback](const char* p_pcServiceName, const hMDNSService p_hMDNSService, bool p_bProbeResult)
-    {
-        p_fnCallback(*this, p_pcServiceName, p_hMDNSService, p_bProbeResult);
-    });
 }
 
 
@@ -1307,13 +1480,13 @@ bool MDNSResponder::setServiceProbeResultCallback(const MDNSResponder::hMDNSServ
 */
 
 /*
-    MDNSResponder::notifyAPChange
+    MDNSResponder::notifyNetIfChange
 
     Should be called, whenever the AP for the MDNS responder changes.
     A bit of this is caught by the event callbacks installed in the constructor.
 
 */
-bool MDNSResponder::notifyAPChange(void)
+bool MDNSResponder::notifyNetIfChange(void)
 {
 
     return _restart();

@@ -37,11 +37,8 @@ namespace MDNSImplementation
 
 // Enable class debug functions
 #define ESP_8266_MDNS_INCLUDE
-//#define DEBUG_ESP_MDNS_RESPONDER
-
-#if !defined(DEBUG_ESP_MDNS_RESPONDER) && defined(DEBUG_ESP_MDNS)
 #define DEBUG_ESP_MDNS_RESPONDER
-#endif
+
 
 #ifndef LWIP_OPEN_SRC
 #define LWIP_OPEN_SRC
@@ -54,7 +51,7 @@ namespace MDNSImplementation
 
 // Enable/disable debug trace macros
 #ifdef DEBUG_ESP_MDNS_RESPONDER
-#define DEBUG_ESP_MDNS_INFO
+//#define DEBUG_ESP_MDNS_INFO
 #define DEBUG_ESP_MDNS_ERR
 #define DEBUG_ESP_MDNS_TX
 #define DEBUG_ESP_MDNS_RX
@@ -64,22 +61,22 @@ namespace MDNSImplementation
 #ifdef DEBUG_ESP_MDNS_INFO
 #define DEBUG_EX_INFO(A)    A
 #else
-#define DEBUG_EX_INFO(A)    do { (void)0; } while (0)
+#define DEBUG_EX_INFO(A)
 #endif
 #ifdef DEBUG_ESP_MDNS_ERR
 #define DEBUG_EX_ERR(A) A
 #else
-#define DEBUG_EX_ERR(A) do { (void)0; } while (0)
+#define DEBUG_EX_ERR(A)
 #endif
 #ifdef DEBUG_ESP_MDNS_TX
 #define DEBUG_EX_TX(A)  A
 #else
-#define DEBUG_EX_TX(A)  do { (void)0; } while (0)
+#define DEBUG_EX_TX(A)
 #endif
 #ifdef DEBUG_ESP_MDNS_RX
 #define DEBUG_EX_RX(A)  A
 #else
-#define DEBUG_EX_RX(A)  do { (void)0; } while (0)
+#define DEBUG_EX_RX(A)
 #endif
 
 #ifdef DEBUG_ESP_PORT
@@ -88,21 +85,11 @@ namespace MDNSImplementation
 #define DEBUG_OUTPUT Serial
 #endif
 #else
-#define DEBUG_EX_INFO(A)    do { (void)0; } while (0)
-#define DEBUG_EX_ERR(A)     do { (void)0; } while (0)
-#define DEBUG_EX_TX(A)      do { (void)0; } while (0)
-#define DEBUG_EX_RX(A)      do { (void)0; } while (0)
+#define DEBUG_EX_INFO(A)
+#define DEBUG_EX_ERR(A)
+#define DEBUG_EX_TX(A)
+#define DEBUG_EX_RX(A)
 #endif
-
-
-/*  Replaced by 'lwip/prot/dns.h' definitions
-    #ifdef MDNS_IP4_SUPPORT
-    #define MDNS_MULTICAST_ADDR_IP4     (IPAddress(224, 0, 0, 251)) // ip_addr_t v4group = DNS_MQUERY_IPV4_GROUP_INIT
-    #endif
-    #ifdef MDNS_IP6_SUPPORT
-    #define MDNS_MULTICAST_ADDR_IP6     (IPAddress("FF02::FB"))     // ip_addr_t v6group = DNS_MQUERY_IPV6_GROUP_INIT
-    #endif*/
-//#define MDNS_MULTICAST_PORT               5353
 
 /*
     This is NOT the TTL (Time-To-Live) for MDNS records, but the
@@ -112,13 +99,14 @@ namespace MDNSImplementation
 
     However, RFC 3171 seems to force 255 instead
 */
-#define MDNS_MULTICAST_TTL              255/*1*/
+#define MDNS_MULTICAST_TTL              255 /* some say 1 is right*/
 
 /*
     This is the MDNS record TTL
     Host level records are set to 2min (120s)
     service level records are set to 75min (4500s)
 */
+#define MDNS_LEGACY_TTL                 10
 #define MDNS_HOST_TTL                   120
 #define MDNS_SERVICE_TTL                4500
 
@@ -140,14 +128,13 @@ namespace MDNSImplementation
 /*
     Delay between and number of probes for host and service domains
     Delay between and number of announces for host and service domains
-    Delay between and number of service queries; the delay is multiplied by the resent number in '_checkServiceQueryCache'
+    Delay between and number of queries; the delay is multiplied by the resent number in '_checkQueryCache'
 */
 #define MDNS_PROBE_DELAY                250
 #define MDNS_PROBE_COUNT                3
 #define MDNS_ANNOUNCE_DELAY             1000
-#define MDNS_ANNOUNCE_COUNT             8
-#define MDNS_DYNAMIC_QUERY_RESEND_COUNT 5
-#define MDNS_DYNAMIC_QUERY_RESEND_DELAY 5000
+#define MDNS_ANNOUNCE_COUNT             3
+#define MDNS_DYNAMIC_QUERY_RESEND_DELAY 1000
 
 
 /*

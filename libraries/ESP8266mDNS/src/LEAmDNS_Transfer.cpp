@@ -26,6 +26,8 @@ extern "C" {
 #include "user_interface.h"
 }
 
+#include "lwip/netif.h"
+
 #include "LEAmDNS_lwIPdefs.h"
 #include "LEAmDNS_Priv.h"
 
@@ -48,11 +50,11 @@ static const char*                      scpcDNSSD               = "dns-sd";
 static const char*                      scpcUDP                 = "udp";
 //static const char*                    scpcTCP                 = "tcp";
 
-#ifdef MDNS_IP4_SUPPORT
-static const char*                  scpcReverseIP4Domain    = "in-addr";
+#ifdef MDNS_IPV4_SUPPORT
+static const char*                  scpcReverseIPv4Domain   = "in-addr";
 #endif
-#ifdef MDNS_IP6_SUPPORT
-static const char*                  scpcReverseIP6Domain    = "ip6";
+#ifdef MDNS_IPV6_SUPPORT
+static const char*                  scpcReverseIPv6Domain   = "ip6";
 #endif
 static const char*                      scpcReverseTopDomain    = "arpa";
 
@@ -77,29 +79,64 @@ static const char*                      scpcReverseTopDomain    = "arpa";
 bool MDNSResponder::_sendMDNSMessage(MDNSResponder::stcMDNSSendParameter& p_rSendParameter)
 {
 
-    bool    bResult = true;
+    bool    bResult = false;
 
-    if (p_rSendParameter.m_bResponse &&
-            p_rSendParameter.m_bUnicast)    // Unicast response  -> Send to querier
+    uint8_t	u8AvailableProtocols = 0;
+#ifdef MDNS_IPV4_SUPPORT
+    u8AvailableProtocols |= static_cast<uint8_t>(enuIPProtocolType::V4);
+#endif
+#ifdef MDNS_IPV6_SUPPORT
+    u8AvailableProtocols |= static_cast<uint8_t>(enuIPProtocolType::V6);
+#endif
+
+    if (stcMDNSSendParameter::enuResponseType::None != p_rSendParameter.m_Response)
     {
-        DEBUG_EX_ERR(if (!m_pUDPContext->getRemoteAddress())
-    {
-        DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _sendMDNSMessage: MISSING remote address for response!\n"));
-        });
-        IPAddress   ipRemote;
-        ipRemote = m_pUDPContext->getRemoteAddress();
-        bResult = ((_prepareMDNSMessage(p_rSendParameter, _getResponseMulticastInterface())) &&
-                   (m_pUDPContext->send(ipRemote, m_pUDPContext->getRemotePort())));
+        IPAddress   ipRemote = ((stcMDNSSendParameter::enuResponseType::Response == p_rSendParameter.m_Response)
+                                ? m_pUDPContext->getRemoteAddress()
+                                : IPAddress());
+
+        if (p_rSendParameter.m_bUnicast)    // Unicast response  -> Send to querier
+        {
+            DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _sendMDNSMessage: Will send unicast to '%s'.\n"), ipRemote.toString().c_str()););
+            DEBUG_EX_ERR(if (!ipRemote.isSet())
+        {
+            DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _sendMDNSMessage: MISSING remote address for unicast response!\n"));
+            });
+
+            bResult = ((ipRemote.isSet()) &&
+                       (_prepareMDNSMessage(p_rSendParameter)) &&
+                       (m_pUDPContext->send(ipRemote, m_pUDPContext->getRemotePort())));
+        }
+        else                                // Multicast response -> Send via the same network interface, that received the query
+        {
+#ifdef MDNS_IPV4_SUPPORT
+            if ((!ipRemote.isSet()) ||      // NO remote IP
+                    (ipRemote.isV4()))          // OR  IPv4
+            {
+
+                bResult = _sendMDNSMessage_Multicast(p_rSendParameter, static_cast<uint8_t>(enuIPProtocolType::V4));
+            }
+#endif
+#ifdef MDNS_IPV6_SUPPORT
+            if ((!ipRemote.isSet()) ||      // NO remote IP
+                    (ipRemote.isV6()))          // OR  IPv6
+            {
+
+                bResult = _sendMDNSMessage_Multicast(p_rSendParameter, static_cast<uint8_t>(enuIPProtocolType::V6));
+            }
+#endif
+        }
     }
-    else                                // Multicast response
+    else                                    // Multicast query -> Send by all available protocols
     {
-        bResult = _sendMDNSMessage_Multicast(p_rSendParameter);
+        bResult = ((u8AvailableProtocols) &&
+                   (_sendMDNSMessage_Multicast(p_rSendParameter, u8AvailableProtocols)));
     }
 
     // Finally clear service reply masks
     for (stcMDNSService* pService = m_pServices; pService; pService = pService->m_pNext)
     {
-        pService->m_u8ReplyMask = 0;
+        pService->m_u32ReplyMask = 0;
     }
 
     DEBUG_EX_ERR(if (!bResult)
@@ -113,33 +150,54 @@ bool MDNSResponder::_sendMDNSMessage(MDNSResponder::stcMDNSSendParameter& p_rSen
     MDNSResponder::_sendMDNSMessage_Multicast
 
     Fills the UDP output buffer (via _prepareMDNSMessage) and sends the buffer
-    via the selected WiFi interface (Station or AP)
+    via the selected WiFi protocols
 */
-bool MDNSResponder::_sendMDNSMessage_Multicast(MDNSResponder::stcMDNSSendParameter& p_rSendParameter)
+bool MDNSResponder::_sendMDNSMessage_Multicast(MDNSResponder::stcMDNSSendParameter& p_rSendParameter,
+        uint8_t p_IPProtocolTypes)
 {
+    bool    bIPv4Result = true;
+    bool    bIPv6Result = true;
 
-    bool    bResult = false;
+#ifdef MDNS_IPV4_SUPPORT
+    if (p_IPProtocolTypes & static_cast<uint8_t>(enuIPProtocolType::V4))
+    {
+        IPAddress	ipResponder = _getResponderIPAddress(enuIPProtocolType::V4);
+        IPAddress   ip4MulticastAddress(DNS_MQUERY_IPV4_GROUP_INIT);
 
-    IPAddress   fromIPAddress;
-    fromIPAddress = _getResponseMulticastInterface();
-    m_pUDPContext->setMulticastInterface(fromIPAddress);
-
-#ifdef MDNS_IP4_SUPPORT
-    IPAddress   toMulticastAddress(DNS_MQUERY_IPV4_GROUP_INIT);
+        DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _sendMDNSMessage_Multicast v4: Will send to '%s'.\n"), ip4MulticastAddress.toString().c_str()););
+        bIPv4Result = ((ipResponder.isSet()) &&
+                       (_prepareMDNSMessage(p_rSendParameter)) &&
+                       (m_pUDPContext->send(ip4MulticastAddress, DNS_MQUERY_PORT)));
+        DEBUG_EX_ERR(if (!bIPv4Result)
+    {
+        DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _sendMDNSMessage_Multicast (V4): FAILED!\n"));
+        });
+    }
 #endif
-#ifdef MDNS_IP6_SUPPORT
-    //TODO: set multicast address
-    IPAddress   toMulticastAddress(DNS_MQUERY_IPV6_GROUP_INIT);
-#endif
-    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _sendMDNSMessage_Multicast: Will send to '%s'.\n"), toMulticastAddress.toString().c_str()););
-    bResult = ((_prepareMDNSMessage(p_rSendParameter, fromIPAddress)) &&
-               (m_pUDPContext->send(toMulticastAddress, DNS_MQUERY_PORT)));
+#ifdef MDNS_IPV6_SUPPORT
+    if (p_IPProtocolTypes & static_cast<uint8_t>(enuIPProtocolType::V6))
+    {
+        IPAddress	ipResponder = _getResponderIPAddress(enuIPProtocolType::V6);
+        IPAddress   ip6MulticastAddress(DNS_MQUERY_IPV6_GROUP_INIT);
 
-    DEBUG_EX_ERR(if (!bResult)
+        DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _sendMDNSMessage_Multicast v6: Will send to '%s'.\n"), ip6MulticastAddress.toString().c_str()););
+        bIPv6Result = ((ipResponder.isSet()) &&
+                       (_prepareMDNSMessage(p_rSendParameter)) &&
+                       (/*DEBUG_OUTPUT.printf_P(PSTR("Will send...\n")),*/ true) &&
+                       (m_pUDPContext->send(ip6MulticastAddress, DNS_MQUERY_PORT)) &&
+                       (/*DEBUG_OUTPUT.printf_P(PSTR("Did send!\n")),*/ true));
+        DEBUG_EX_ERR(if (!bIPv6Result)
+    {
+        DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _sendMDNSMessage_Multicast (V6): FAILED!\n"));
+        });
+    }
+#endif
+
+    DEBUG_EX_ERR(if (!(bIPv4Result && bIPv6Result))
 {
     DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _sendMDNSMessage_Multicast: FAILED!\n"));
     });
-    return bResult;
+    return (bIPv4Result && bIPv6Result);
 }
 
 /*
@@ -151,31 +209,34 @@ bool MDNSResponder::_sendMDNSMessage_Multicast(MDNSResponder::stcMDNSSendParamet
     output buffer.
 
 */
-bool MDNSResponder::_prepareMDNSMessage(MDNSResponder::stcMDNSSendParameter& p_rSendParameter,
-                                        IPAddress p_IPAddress)
+bool MDNSResponder::_prepareMDNSMessage(MDNSResponder::stcMDNSSendParameter& p_rSendParameter)
 {
-    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage\n")););
+    //DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage\n")););
     bool    bResult = true;
 
+    // Prepare output buffer for potential reuse
+    p_rSendParameter.flushTempContent();
+
     // Prepare header; count answers
-    stcMDNS_MsgHeader  msgHeader(p_rSendParameter.m_u16ID, p_rSendParameter.m_bResponse, 0, p_rSendParameter.m_bAuthorative);
+    stcMDNS_MsgHeader  msgHeader(0, (static_cast<stcMDNSSendParameter::enuResponseType>(stcMDNSSendParameter::enuResponseType::None) != p_rSendParameter.m_Response), 0, p_rSendParameter.m_bAuthorative);
     // If this is a response, the answers are anwers,
     // else this is a query or probe and the answers go into auth section
-    uint16_t&           ru16Answers = (p_rSendParameter.m_bResponse
-                                       ? msgHeader.m_u16ANCount
-                                       : msgHeader.m_u16NSCount);
+    uint16_t&           ru16Answers = ((stcMDNSSendParameter::enuResponseType::None != p_rSendParameter.m_Response)
+                                       ? msgHeader.m_u16ANCount    // Usual answers
+                                       : msgHeader.m_u16NSCount);  // Authorative answers
 
     /**
         enuSequence
     */
-    enum enuSequence
+    using typeSequence = uint8_t;
+    enum class enuSequence : typeSequence
     {
-        Sequence_Count  = 0,
-        Sequence_Send   = 1
+        Count   = 0,
+        Send    = 1
     };
 
     // Two step sequence: 'Count' and 'Send'
-    for (uint32_t sequence = Sequence_Count; ((bResult) && (sequence <= Sequence_Send)); ++sequence)
+    for (typeSequence sequence = static_cast<typeSequence>(enuSequence::Count); ((bResult) && (sequence <= static_cast<typeSequence>(enuSequence::Send))); ++sequence)
     {
         DEBUG_EX_INFO(
             if (Sequence_Send == sequence)
@@ -192,87 +253,109 @@ bool MDNSResponder::_prepareMDNSMessage(MDNSResponder::stcMDNSSendParameter& p_r
         );
         // Count/send
         // Header
-        bResult = ((Sequence_Count == sequence)
+        bResult = ((static_cast<typeSequence>(enuSequence::Count) == sequence)
                    ? true
                    : _writeMDNSMsgHeader(msgHeader, p_rSendParameter));
         DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSMsgHeader FAILED!\n")););
         // Questions
         for (stcMDNS_RRQuestion* pQuestion = p_rSendParameter.m_pQuestions; ((bResult) && (pQuestion)); pQuestion = pQuestion->m_pNext)
         {
-            ((Sequence_Count == sequence)
+            ((static_cast<typeSequence>(enuSequence::Count) == sequence)
              ? ++msgHeader.m_u16QDCount
              : (bResult = _writeMDNSQuestion(*pQuestion, p_rSendParameter)));
             DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSQuestion FAILED!\n")););
         }
 
         // Answers and authorative answers
-#ifdef MDNS_IP4_SUPPORT
+        // NSEC host (part 1)
+        uint32_t    u32NSECContent = 0;
+#ifdef MDNS_IPV4_SUPPORT
+        // A
         if ((bResult) &&
-                (p_rSendParameter.m_u8HostReplyMask & ContentFlag_A))
+                (p_rSendParameter.m_u32HostReplyMask & static_cast<uint32_t>(enuContentFlag::A)) &&
+                (_getResponderIPAddress(enuIPProtocolType::V4).isSet()))
         {
-            ((Sequence_Count == sequence)
+
+            u32NSECContent |= static_cast<uint32_t>(enuContentFlag::A);
+            ((static_cast<typeSequence>(enuSequence::Count) == sequence)
              ? ++ru16Answers
-             : (bResult = _writeMDNSAnswer_A(p_IPAddress, p_rSendParameter)));
+             : (bResult = _writeMDNSAnswer_A(_getResponderIPAddress(enuIPProtocolType::V4), p_rSendParameter)));
             DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_A(A) FAILED!\n")););
         }
+        // PTR_IPv4
         if ((bResult) &&
-                (p_rSendParameter.m_u8HostReplyMask & ContentFlag_PTR_IP4))
+                (p_rSendParameter.m_u32HostReplyMask & static_cast<uint32_t>(enuContentFlag::PTR_IPv4)) &&
+                (_getResponderIPAddress(enuIPProtocolType::V4).isSet()))
         {
-            ((Sequence_Count == sequence)
+
+            u32NSECContent |= static_cast<uint32_t>(enuContentFlag::PTR_IPv4);
+            ((static_cast<typeSequence>(enuSequence::Count) == sequence)
              ? ++ru16Answers
-             : (bResult = _writeMDNSAnswer_PTR_IP4(p_IPAddress, p_rSendParameter)));
-            DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_PTR_IP4 FAILED!\n")););
+             : (bResult = _writeMDNSAnswer_PTR_IPv4(_getResponderIPAddress(enuIPProtocolType::V4), p_rSendParameter)));
+            DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_PTR_IPv4 FAILED!\n")););
         }
 #endif
-#ifdef MDNS_IP6_SUPPORT
+#ifdef MDNS_IPV6_SUPPORT
+        // AAAA
         if ((bResult) &&
-                (p_rSendParameter.m_u8HostReplyMask & ContentFlag_AAAA))
+                (p_rSendParameter.m_u32HostReplyMask & static_cast<uint32_t>(enuContentFlag::AAAA)) &&
+                (_getResponderIPAddress(enuIPProtocolType::V6).isSet()))
         {
-            ((Sequence_Count == sequence)
+
+            u32NSECContent |= static_cast<uint32_t>(enuContentFlag::AAAA);
+            ((static_cast<typeSequence>(enuSequence::Count) == sequence)
              ? ++ru16Answers
-             : (bResult = _writeMDNSAnswer_AAAA(p_IPAddress, p_rSendParameter)));
+             : (bResult = _writeMDNSAnswer_AAAA(_getResponderIPAddress(enuIPProtocolType::V6), p_rSendParameter)));
             DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_AAAA(A) FAILED!\n")););
         }
+        // PTR_IPv6
         if ((bResult) &&
-                (p_rSendParameter.m_u8HostReplyMask & ContentFlag_PTR_IP6))
+                (p_rSendParameter.m_u32HostReplyMask & static_cast<uint32_t>(enuContentFlag::PTR_IPv6)) &&
+                (_getResponderIPAddress(enuIPProtocolType::V6).isSet()))
         {
-            ((Sequence_Count == sequence)
+
+            u32NSECContent |= static_cast<uint32_t>(enuContentFlag::PTR_IPv6);
+            ((static_cast<typeSequence>(enuSequence::Count) == sequence)
              ? ++ru16Answers
-             : (bResult = _writeMDNSAnswer_PTR_IP6(p_IPAddress, p_rSendParameter)));
-            DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_PTR_IP6 FAILED!\n")););
+             : (bResult = _writeMDNSAnswer_PTR_IPv6(_getResponderIPAddress(enuIPProtocolType::V6), p_rSendParameter)));
+            DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_PTR_IPv6 FAILED!\n")););
         }
 #endif
 
         for (stcMDNSService* pService = m_pServices; ((bResult) && (pService)); pService = pService->m_pNext)
         {
+            // PTR_TYPE
             if ((bResult) &&
-                    (pService->m_u8ReplyMask & ContentFlag_PTR_TYPE))
+                    (pService->m_u32ReplyMask & static_cast<uint32_t>(enuContentFlag::PTR_TYPE)))
             {
-                ((Sequence_Count == sequence)
+                ((static_cast<typeSequence>(enuSequence::Count) == sequence)
                  ? ++ru16Answers
                  : (bResult = _writeMDNSAnswer_PTR_TYPE(*pService, p_rSendParameter)));
                 DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_PTR_TYPE FAILED!\n")););
             }
+            // PTR_NAME
             if ((bResult) &&
-                    (pService->m_u8ReplyMask & ContentFlag_PTR_NAME))
+                    (pService->m_u32ReplyMask & static_cast<uint32_t>(enuContentFlag::PTR_NAME)))
             {
-                ((Sequence_Count == sequence)
+                ((static_cast<typeSequence>(enuSequence::Count) == sequence)
                  ? ++ru16Answers
                  : (bResult = _writeMDNSAnswer_PTR_NAME(*pService, p_rSendParameter)));
                 DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_PTR_NAME FAILED!\n")););
             }
+            // SRV
             if ((bResult) &&
-                    (pService->m_u8ReplyMask & ContentFlag_SRV))
+                    (pService->m_u32ReplyMask & static_cast<uint32_t>(enuContentFlag::SRV)))
             {
-                ((Sequence_Count == sequence)
+                ((static_cast<typeSequence>(enuSequence::Count) == sequence)
                  ? ++ru16Answers
                  : (bResult = _writeMDNSAnswer_SRV(*pService, p_rSendParameter)));
                 DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_SRV(A) FAILED!\n")););
             }
+            // TXT
             if ((bResult) &&
-                    (pService->m_u8ReplyMask & ContentFlag_TXT))
+                    (pService->m_u32ReplyMask & static_cast<uint32_t>(enuContentFlag::TXT)))
             {
-                ((Sequence_Count == sequence)
+                ((static_cast<typeSequence>(enuSequence::Count) == sequence)
                  ? ++ru16Answers
                  : (bResult = _writeMDNSAnswer_TXT(*pService, p_rSendParameter)));
                 DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_TXT(A) FAILED!\n")););
@@ -280,74 +363,143 @@ bool MDNSResponder::_prepareMDNSMessage(MDNSResponder::stcMDNSSendParameter& p_r
         }   // for services
 
         // Additional answers
-#ifdef MDNS_IP4_SUPPORT
+        uint16_t&   ru16AdditionalAnswers = msgHeader.m_u16ARCount;
+
+#ifdef MDNS_IPV4_SUPPORT
         bool    bNeedsAdditionalAnswerA = false;
 #endif
-#ifdef MDNS_IP6_SUPPORT
+#ifdef MDNS_IPV6_SUPPORT
         bool    bNeedsAdditionalAnswerAAAA = false;
 #endif
         for (stcMDNSService* pService = m_pServices; ((bResult) && (pService)); pService = pService->m_pNext)
         {
             if ((bResult) &&
-                    (pService->m_u8ReplyMask & ContentFlag_PTR_NAME) && // If PTR_NAME is requested, AND
-                    (!(pService->m_u8ReplyMask & ContentFlag_SRV)))     // NOT SRV -> add SRV as additional answer
+                    (pService->m_u32ReplyMask & static_cast<uint32_t>(enuContentFlag::PTR_NAME)) &&    // If PTR_NAME is requested, AND
+                    (!(pService->m_u32ReplyMask & static_cast<uint32_t>(enuContentFlag::SRV))))        // NOT SRV -> add SRV as additional answer
             {
-                ((Sequence_Count == sequence)
-                 ? ++msgHeader.m_u16ARCount
+
+                ((static_cast<typeSequence>(enuSequence::Count) == sequence)
+                 ? ++ru16AdditionalAnswers
                  : (bResult = _writeMDNSAnswer_SRV(*pService, p_rSendParameter)));
                 DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_SRV(B) FAILED!\n")););
             }
-            if ((bResult) &&
-                    (pService->m_u8ReplyMask & ContentFlag_PTR_NAME) && // If PTR_NAME is requested, AND
-                    (!(pService->m_u8ReplyMask & ContentFlag_TXT)))     // NOT TXT -> add TXT as additional answer
-            {
-                ((Sequence_Count == sequence)
-                 ? ++msgHeader.m_u16ARCount
-                 : (bResult = _writeMDNSAnswer_TXT(*pService, p_rSendParameter)));
-                DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_TXT(B) FAILED!\n")););
-            }
-            if ((pService->m_u8ReplyMask & (ContentFlag_PTR_NAME | ContentFlag_SRV)) ||         // If service instance name or SRV OR
-                    (p_rSendParameter.m_u8HostReplyMask & (ContentFlag_A | ContentFlag_AAAA)))      // any host IP address is requested
-            {
-#ifdef MDNS_IP4_SUPPORT
+            /*  AppleTV doesn't add TXT
                 if ((bResult) &&
-                        (!(p_rSendParameter.m_u8HostReplyMask & ContentFlag_A)))            // Add IP4 address
+                (pService->m_u32ReplyMask & ContentFlag_PTR_NAME) &&    // If PTR_NAME is requested, AND
+                (!(pService->m_u32ReplyMask & ContentFlag_TXT))) {      // NOT TXT -> add TXT as additional answer
+                ((static_cast<typeSequence>(enuSequence::Count) == sequence)
+                    ? ++ru16AdditionalAnswers
+                    : (bResult = _writeMDNSAnswer_TXT(*pService, p_rSendParameter)));
+                DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_TXT(B) FAILED!\n")););
+                }
+            */
+            if ((pService->m_u32ReplyMask & (static_cast<uint32_t>(enuContentFlag::PTR_NAME) | static_cast<uint32_t>(enuContentFlag::SRV))) ||          // If service instance name or SRV OR
+                    (p_rSendParameter.m_u32HostReplyMask & (static_cast<uint32_t>(enuContentFlag::A) | static_cast<uint32_t>(enuContentFlag::AAAA))))       // any host IP address is requested
+            {
+#ifdef MDNS_IPV4_SUPPORT
+                if ((bResult) &&
+                        (!(p_rSendParameter.m_u32HostReplyMask & static_cast<uint32_t>(enuContentFlag::A))))                   // Add IPv4 address
                 {
                     bNeedsAdditionalAnswerA = true;
                 }
 #endif
-#ifdef MDNS_IP6_SUPPORT
+#ifdef MDNS_IPV6_SUPPORT
                 if ((bResult) &&
-                        (!(p_rSendParameter.m_u8HostReplyMask & ContentFlag_AAAA)))         // Add IP6 address
+                        (!(p_rSendParameter.m_u32HostReplyMask & static_cast<uint32_t>(enuContentFlag::AAAA))))                // Add IPv6 address
                 {
                     bNeedsAdditionalAnswerAAAA = true;
                 }
 #endif
             }
+            // NSEC record for service
+            if ((bResult) &&
+                    (pService->m_u32ReplyMask) &&
+                    ((stcMDNSSendParameter::enuResponseType::None != p_rSendParameter.m_Response)))
+            {
+
+                ((static_cast<typeSequence>(enuSequence::Count) == sequence)
+                 ? ++ru16AdditionalAnswers
+                 : (bResult = _writeMDNSAnswer_NSEC(*pService, (static_cast<uint32_t>(enuContentFlag::TXT) | static_cast<uint32_t>(enuContentFlag::SRV)), p_rSendParameter)));
+                DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_NSEC(Service) FAILED!\n")););
+            }
         }   // for services
 
+#ifdef MDNS_IPV4_SUPPORT
         // Answer A needed?
-#ifdef MDNS_IP4_SUPPORT
         if ((bResult) &&
-                (bNeedsAdditionalAnswerA))
+                (bNeedsAdditionalAnswerA) &&
+                (_getResponderIPAddress(enuIPProtocolType::V4).isSet()))
         {
-            ((Sequence_Count == sequence)
-             ? ++msgHeader.m_u16ARCount
-             : (bResult = _writeMDNSAnswer_A(p_IPAddress, p_rSendParameter)));
+            // Additional A
+            u32NSECContent |= static_cast<uint32_t>(enuContentFlag::A);
+            ((static_cast<typeSequence>(enuSequence::Count) == sequence)
+             ? ++ru16AdditionalAnswers
+             : (bResult = _writeMDNSAnswer_A(_getResponderIPAddress(enuIPProtocolType::V4), p_rSendParameter)));
+
             DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_A(B) FAILED!\n")););
         }
 #endif
-#ifdef MDNS_IP6_SUPPORT
+#ifdef MDNS_IPV6_SUPPORT
         // Answer AAAA needed?
         if ((bResult) &&
-                (bNeedsAdditionalAnswerAAAA))
+                (bNeedsAdditionalAnswerAAAA) &&
+                (_getResponderIPAddress(enuIPProtocolType::V6).isSet()))
         {
-            ((Sequence_Count == sequence)
-             ? ++msgHeader.m_u16ARCount
-             : (bResult = _writeMDNSAnswer_AAAA(p_IPAddress, p_rSendParameter)));
+            // Additional AAAA
+            u32NSECContent |= static_cast<uint32_t>(enuContentFlag::AAAA);
+            ((static_cast<typeSequence>(enuSequence::Count) == sequence)
+             ? ++ru16AdditionalAnswers
+             : (bResult = _writeMDNSAnswer_AAAA(_getResponderIPAddress(enuIPProtocolType::V6), p_rSendParameter)));
+
             DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_AAAA(B) FAILED!\n")););
         }
 #endif
+
+        // NSEC host (part 2)
+        if ((bResult) &&
+                ((stcMDNSSendParameter::enuResponseType::None != p_rSendParameter.m_Response)) &&
+                (u32NSECContent))
+        {
+
+            // NSEC PTR IPv4/IPv6 are separate answers; make sure, that this is counted for
+#ifdef MDNS_IPV4_SUPPORT
+            uint32_t    u32NSECContent_PTR_IPv4 = (u32NSECContent & static_cast<uint32_t>(enuContentFlag::PTR_IPv4));
+            u32NSECContent &= ~static_cast<uint32_t>(enuContentFlag::PTR_IPv4);
+#endif
+#ifdef MDNS_IPV6_SUPPORT
+            uint32_t    u32NSECContent_PTR_IPv6 = (u32NSECContent & static_cast<uint32_t>(enuContentFlag::PTR_IPv6));
+            u32NSECContent &= ~static_cast<uint32_t>(enuContentFlag::PTR_IPv6);
+#endif
+
+            ((static_cast<typeSequence>(enuSequence::Count) == sequence)
+             ? (ru16AdditionalAnswers += ((u32NSECContent ? 1 : 0)
+#ifdef MDNS_IPV4_SUPPORT
+                                          + (u32NSECContent_PTR_IPv4 ? 1 : 0)
+#endif
+#ifdef MDNS_IPV6_SUPPORT
+                                          + (u32NSECContent_PTR_IPv6 ? 1 : 0)
+#endif
+                                         ))
+             : (bResult = (((!u32NSECContent) ||
+                            // Write host domain NSEC answer
+                            (_writeMDNSAnswer_NSEC(u32NSECContent, p_rSendParameter)))
+#ifdef MDNS_IPV4_SUPPORT
+                           // Write separate answer for host PTR IPv4
+                           && ((!u32NSECContent_PTR_IPv4) ||
+                               ((!_getResponderIPAddress(enuIPProtocolType::V4).isSet()) ||
+                                (_writeMDNSAnswer_NSEC_PTR_IPv4(_getResponderIPAddress(enuIPProtocolType::V4), p_rSendParameter))))
+#endif
+#ifdef MDNS_IPV6_SUPPORT
+                           // Write separate answer for host PTR IPv6
+                           && ((!u32NSECContent_PTR_IPv6) ||
+                               ((!_getResponderIPAddress(enuIPProtocolType::V6)) ||
+                                (_writeMDNSAnswer_NSEC_PTR_IPv6(_getResponderIPAddress(enuIPProtocolType::V6), p_rSendParameter))))
+#endif
+                          )));
+
+            DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: _writeMDNSAnswer_NSEC(Host) FAILED!\n")););
+        }
+
         DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: Loop %i FAILED!\n"), sequence););
     }   // for sequence
     DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _prepareMDNSMessage: FAILED!\n")););
@@ -355,15 +507,32 @@ bool MDNSResponder::_prepareMDNSMessage(MDNSResponder::stcMDNSSendParameter& p_r
 }
 
 /*
-    MDNSResponder::_sendMDNSServiceQuery
+    MDNSResponder::_addMDNSQueryRecord
 
-    Creates and sends a PTR query for the given service domain.
+    Adds a query for the given domain and query type.
 
 */
-bool MDNSResponder::_sendMDNSServiceQuery(const MDNSResponder::stcMDNSServiceQuery& p_ServiceQuery)
+bool MDNSResponder::_addMDNSQueryRecord(MDNSResponder::stcMDNSSendParameter& p_rSendParameter,
+                                        const MDNSResponder::stcMDNS_RRDomain& p_QueryDomain,
+                                        uint16_t p_u16RecordType)
 {
 
-    return _sendMDNSQuery(p_ServiceQuery.m_ServiceTypeDomain, DNS_RRTYPE_PTR);
+    bool    bResult = false;
+
+    stcMDNS_RRQuestion* pQuestion = new stcMDNS_RRQuestion;
+    if ((bResult = (0 != pQuestion)))
+    {
+        // Link to list of questions
+        pQuestion->m_pNext = p_rSendParameter.m_pQuestions;
+        p_rSendParameter.m_pQuestions = pQuestion;
+
+        pQuestion->m_Header.m_Domain = p_QueryDomain;
+
+        pQuestion->m_Header.m_Attributes.m_u16Type = p_u16RecordType;
+        // It seems, that some mDNS implementations don't support 'unicast response' questions...
+        pQuestion->m_Header.m_Attributes.m_u16Class = (/*0x8000 |*/ DNS_RRCLASS_IN);   // /*Unicast &*/ INternet
+    }
+    return bResult;
 }
 
 /*
@@ -372,30 +541,107 @@ bool MDNSResponder::_sendMDNSServiceQuery(const MDNSResponder::stcMDNSServiceQue
     Creates and sends a query for the given domain and query type.
 
 */
-bool MDNSResponder::_sendMDNSQuery(const MDNSResponder::stcMDNS_RRDomain& p_QueryDomain,
-                                   uint16_t p_u16QueryType,
-                                   stcMDNSServiceQuery::stcAnswer* p_pKnownAnswers /*= 0*/)
+bool MDNSResponder::_sendMDNSQuery(const MDNSResponder::stcMDNSQuery& p_Query,
+                                   MDNSResponder::stcMDNSQuery::stcAnswer* p_pKnownAnswers /*= 0*/)
 {
 
     bool                    bResult = false;
 
     stcMDNSSendParameter    sendParameter;
-    if (0 != ((sendParameter.m_pQuestions = new stcMDNS_RRQuestion)))
+    switch (p_Query.m_QueryType)
     {
-        sendParameter.m_pQuestions->m_Header.m_Domain = p_QueryDomain;
+    case stcMDNSQuery::enuQueryType::Host:
+#ifdef MDNS_IPV4_SUPPORT
+        bResult = _addMDNSQueryRecord(sendParameter, p_Query.m_Domain, DNS_RRTYPE_A);
+#endif
+#ifdef MDNS_IPV6_SUPPORT
+        bResult = _addMDNSQueryRecord(sendParameter, p_Query.m_Domain, DNS_RRTYPE_AAAA);
+#endif
+        break;
 
-        sendParameter.m_pQuestions->m_Header.m_Attributes.m_u16Type = p_u16QueryType;
-        // It seems, that some mDNS implementations don't support 'unicast response' questions...
-        sendParameter.m_pQuestions->m_Header.m_Attributes.m_u16Class = (/*0x8000 |*/ DNS_RRCLASS_IN);   // /*Unicast &*/ INternet
+    case stcMDNSQuery::enuQueryType::Service:
+        bResult = _addMDNSQueryRecord(sendParameter, p_Query.m_Domain, DNS_RRTYPE_PTR);
+        break;
 
-        // TODO: Add knwon answer to the query
-        (void)p_pKnownAnswers;
+    case stcMDNSQuery::enuQueryType::None:
+    default:
+        break;
+    }
 
-        bResult = _sendMDNSMessage(sendParameter);
-    }   // else: FAILED to alloc question
-    DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _sendMDNSQuery: FAILED to alloc question!\n")););
+    // TODO: Add known answers to query
+    (void)p_pKnownAnswers;
+
+    bResult = ((bResult) &&
+               (_sendMDNSMessage(sendParameter)));
+    DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _sendMDNSQuery: FAILED!\n")););
     return bResult;
 }
+
+/*
+    MDNSResponder::_sendMDNSQuery
+
+    Creates and sends a query for the given domain and record type.
+
+*/
+bool MDNSResponder::_sendMDNSQuery(const MDNSResponder::stcMDNS_RRDomain& p_QueryDomain,
+                                   uint16_t p_u16RecordType,
+                                   MDNSResponder::stcMDNSQuery::stcAnswer* p_pKnownAnswers /*= 0*/)
+{
+
+    bool                    bResult = false;
+
+    stcMDNSSendParameter    sendParameter;
+    bResult = ((_addMDNSQueryRecord(sendParameter, p_QueryDomain, p_u16RecordType)) &&
+               (_sendMDNSMessage(sendParameter)));
+
+    // TODO: Add known answer records
+    (void) p_pKnownAnswers;
+
+    DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _sendMDNSQuery: FAILED!\n")););
+    return bResult;
+}
+
+/*
+    MDNSResponder::_getResponderIPAddress
+*/
+IPAddress MDNSResponder::_getResponderIPAddress(enuIPProtocolType p_IPProtocolType) const
+{
+
+    IPAddress	ipResponder;
+#ifdef MDNS_IPV4_SUPPORT
+    if ((m_pNetIf) &&
+            (enuIPProtocolType::V4 == p_IPProtocolType))
+    {
+
+        ipResponder = netif_ip_addr4(m_pNetIf);
+    }
+#endif
+#ifdef MDNS_IPV6_SUPPORT
+    if ((m_pNetIf) &&
+            (enuIPProtocolType::V6 == p_IPProtocolType))
+    {
+
+        bool	bCheckLinkLocal = true;
+        for (int i = 0; ((!ipResponder.isSet()) && (i < 2)); ++i)  	// Two loops: First with link-local check, second without
+        {
+            for (int idx = 0; idx < LWIP_IPV6_NUM_ADDRESSES; ++idx)
+            {
+                if ((ip6_addr_isvalid(netif_ip6_addr_state(m_pNetIf, idx))) &&
+                        (((!bCheckLinkLocal) ||
+                          (ip6_addr_islinklocal(netif_ip6_addr(m_pNetIf, idx))))))
+                {
+
+                    ipResponder = netif_ip_addr6(m_pNetIf, idx);
+                    break;
+                }
+            }
+            bCheckLinkLocal = false;
+        }
+    }
+#endif
+    return ipResponder;
+}
+
 
 /**
     HELPERS
@@ -413,7 +659,7 @@ bool MDNSResponder::_sendMDNSQuery(const MDNSResponder::stcMDNS_RRDomain& p_Quer
 */
 bool MDNSResponder::_readRRQuestion(MDNSResponder::stcMDNS_RRQuestion& p_rRRQuestion)
 {
-    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _readRRQuestion\n")););
+    //DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _readRRQuestion\n")););
 
     bool    bResult = false;
 
@@ -421,12 +667,12 @@ bool MDNSResponder::_readRRQuestion(MDNSResponder::stcMDNS_RRQuestion& p_rRRQues
     {
         // Extract unicast flag from class field
         p_rRRQuestion.m_bUnicast = (p_rRRQuestion.m_Header.m_Attributes.m_u16Class & 0x8000);
-        p_rRRQuestion.m_Header.m_Attributes.m_u16Class &= (~0x8000);
+        //p_rRRQuestion.m_Header.m_Attributes.m_u16Class &= (~0x8000);
 
         DEBUG_EX_INFO(
             DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _readRRQuestion "));
             _printRRDomain(p_rRRQuestion.m_Header.m_Domain);
-            DEBUG_OUTPUT.printf_P(PSTR(" Type:0x%04X Class:0x%04X %s\n"), (unsigned)p_rRRQuestion.m_Header.m_Attributes.m_u16Type, (unsigned)p_rRRQuestion.m_Header.m_Attributes.m_u16Class, (p_rRRQuestion.m_bUnicast ? "Unicast" : "Multicast"));
+            DEBUG_OUTPUT.printf_P(PSTR(" Type:%s Class:%s\n"), _RRType2Name(p_rRRQuestion.m_Header.m_Attributes.m_u16Type), _RRClass2String(p_rRRQuestion.m_Header.m_Attributes.m_u16Class, true));
         );
     }
     DEBUG_EX_ERR(if (!bResult)
@@ -469,7 +715,7 @@ bool MDNSResponder::_readRRAnswer(MDNSResponder::stcMDNS_RRAnswer*& p_rpRRAnswer
 
         switch (header.m_Attributes.m_u16Type & (~0x8000))      // Topmost bit might carry 'cache flush' flag
         {
-#ifdef MDNS_IP4_SUPPORT
+#ifdef MDNS_IPV4_SUPPORT
         case DNS_RRTYPE_A:
             p_rpRRAnswer = new stcMDNS_RRAnswerA(header, u32TTL);
             bResult = _readRRAnswerA(*(stcMDNS_RRAnswerA*&)p_rpRRAnswer, u16RDLength);
@@ -483,7 +729,7 @@ bool MDNSResponder::_readRRAnswer(MDNSResponder::stcMDNS_RRAnswer*& p_rpRRAnswer
             p_rpRRAnswer = new stcMDNS_RRAnswerTXT(header, u32TTL);
             bResult = _readRRAnswerTXT(*(stcMDNS_RRAnswerTXT*&)p_rpRRAnswer, u16RDLength);
             break;
-#ifdef MDNS_IP6_SUPPORT
+#ifdef MDNS_IPV6_SUPPORT
         case DNS_RRTYPE_AAAA:
             p_rpRRAnswer = new stcMDNS_RRAnswerAAAA(header, u32TTL);
             bResult = _readRRAnswerAAAA(*(stcMDNS_RRAnswerAAAA*&)p_rpRRAnswer, u16RDLength);
@@ -504,10 +750,10 @@ bool MDNSResponder::_readRRAnswer(MDNSResponder::stcMDNS_RRAnswer*& p_rpRRAnswer
     {
         DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _readRRAnswer: "));
             _printRRDomain(p_rpRRAnswer->m_Header.m_Domain);
-            DEBUG_OUTPUT.printf_P(PSTR(" Type:0x%04X Class:0x%04X TTL:%u, RDLength:%u "), p_rpRRAnswer->m_Header.m_Attributes.m_u16Type, p_rpRRAnswer->m_Header.m_Attributes.m_u16Class, p_rpRRAnswer->m_u32TTL, u16RDLength);
+            DEBUG_OUTPUT.printf_P(PSTR(" Type:%s Class:0x%04X TTL:%u, RDLength:%u "), _RRType2Name(p_rpRRAnswer->m_Header.m_Attributes.m_u16Type), p_rpRRAnswer->m_Header.m_Attributes.m_u16Class, p_rpRRAnswer->m_u32TTL, u16RDLength);
             switch (header.m_Attributes.m_u16Type & (~0x8000))      // Topmost bit might carry 'cache flush' flag
             {
-#ifdef MDNS_IP4_SUPPORT
+#ifdef MDNS_IPV4_SUPPORT
             case DNS_RRTYPE_A:
                 DEBUG_OUTPUT.printf_P(PSTR("A IP:%s"), ((stcMDNS_RRAnswerA*&)p_rpRRAnswer)->m_IPAddress.toString().c_str());
                 break;
@@ -528,15 +774,26 @@ bool MDNSResponder::_readRRAnswer(MDNSResponder::stcMDNS_RRAnswer*& p_rpRRAnswer
                 }
                 break;
             }
-#ifdef MDNS_IP6_SUPPORT
+#ifdef MDNS_IPV6_SUPPORT
             case DNS_RRTYPE_AAAA:
-                DEBUG_OUTPUT.printf_P(PSTR("AAAA IP:%s"), ((stcMDNS_RRAnswerA*&)p_rpRRAnswer)->m_IPAddress.toString().c_str());
+                DEBUG_OUTPUT.printf_P(PSTR("AAAA IP:%s"), ((stcMDNS_RRAnswerAAAA*&)p_rpRRAnswer)->m_IPAddress.toString().c_str());
                 break;
 #endif
             case DNS_RRTYPE_SRV:
                 DEBUG_OUTPUT.printf_P(PSTR("SRV Port:%u "), ((stcMDNS_RRAnswerSRV*&)p_rpRRAnswer)->m_u16Port);
                 _printRRDomain(((stcMDNS_RRAnswerSRV*&)p_rpRRAnswer)->m_SRVDomain);
                 break;
+            /*  case DNS_RRTYPE_NSEC:
+                DEBUG_OUTPUT.printf_P(PSTR("NSEC "));
+                _printRRDomain(((stcMDNS_RRAnswerNSEC*&)p_rpRRAnswer)->m_NSECDomain);
+                for (uint32_t u=0; u<(((stcMDNS_RRAnswerNSEC*&)p_rpRRAnswer)->m_pNSECBitmap->m_u16BitmapLength * 8); ++u) {
+                    uint8_t byte = ((stcMDNS_RRAnswerNSEC*&)p_rpRRAnswer)->m_pNSECBitmap->m_pu8BitmapData[u / 8];
+                    uint8_t flag = 1 << (7 - (u % 8)); // (7 - (0..7)) = 7..0
+                    if (byte & flag) {
+                        DEBUG_OUTPUT.printf_P(PSTR(" %s"), _RRType2Name(u));
+                    }
+                }
+                break;*/
             default:
                 DEBUG_OUTPUT.printf_P(PSTR("generic "));
                 break;
@@ -553,7 +810,7 @@ bool MDNSResponder::_readRRAnswer(MDNSResponder::stcMDNS_RRAnswer*& p_rpRRAnswer
     return bResult;
 }
 
-#ifdef MDNS_IP4_SUPPORT
+#ifdef MDNS_IPV4_SUPPORT
 /*
     MDNSResponder::_readRRAnswerA
 */
@@ -561,10 +818,10 @@ bool MDNSResponder::_readRRAnswerA(MDNSResponder::stcMDNS_RRAnswerA& p_rRRAnswer
                                    uint16_t p_u16RDLength)
 {
 
-    uint32_t    u32IP4Address;
-    bool        bResult = ((MDNS_IP4_SIZE == p_u16RDLength) &&
-                           (_udpReadBuffer((unsigned char*)&u32IP4Address, MDNS_IP4_SIZE)) &&
-                           ((p_rRRAnswerA.m_IPAddress = IPAddress(u32IP4Address))));
+    uint32_t    u32IPv4Address;
+    bool        bResult = ((MDNS_IPV4_SIZE == p_u16RDLength) &&
+                           (_udpReadBuffer((unsigned char*)&u32IPv4Address, MDNS_IPV4_SIZE)) &&
+                           ((p_rRRAnswerA.m_IPAddress = IPAddress(u32IPv4Address))));
     DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _readRRAnswerA: FAILED!\n")););
     return bResult;
 }
@@ -701,12 +958,22 @@ bool MDNSResponder::_readRRAnswerTXT(MDNSResponder::stcMDNS_RRAnswerTXT& p_rRRAn
     return bResult;
 }
 
-#ifdef MDNS_IP6_SUPPORT
+#ifdef MDNS_IPV6_SUPPORT
 bool MDNSResponder::_readRRAnswerAAAA(MDNSResponder::stcMDNS_RRAnswerAAAA& p_rRRAnswerAAAA,
                                       uint16_t p_u16RDLength)
 {
-    bool    bResult = false;
-    // TODO: Implement
+    bool	bResult = false;
+
+    uint32_t	au32IPv6Address[4];	// 16 bytes
+    if ((bResult = ((MDNS_IPV6_SIZE == p_u16RDLength) &&
+                    (_udpReadBuffer((uint8_t*)&au32IPv6Address[0], MDNS_IPV6_SIZE)))))
+    {
+
+        // ?? IPADDR6_INIT_HOST ??
+        ip_addr_t	addr = IPADDR6_INIT(au32IPv6Address[0], au32IPv6Address[1], au32IPv6Address[2], au32IPv6Address[3]);
+        p_rRRAnswerAAAA.m_IPAddress = IPAddress(addr);
+    }
+    DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _readRRAnswerAAAA: FAILED!\n")););
     return bResult;
 }
 #endif
@@ -974,48 +1241,73 @@ bool MDNSResponder::_buildDomainForService(const char* p_pcService,
     return bResult;
 }
 
-#ifdef MDNS_IP4_SUPPORT
+#ifdef MDNS_IPV4_SUPPORT
 /*
-    MDNSResponder::_buildDomainForReverseIP4
+    MDNSResponder::_buildDomainForReverseIPv4
 
-    The IP4 address is stringized by printing the four address bytes into a char buffer in reverse order
+    The IPv4 address is stringized by printing the four address bytes into a char buffer in reverse order
     and adding 'in-addr.arpa' (eg. 012.789.456.123.in-addr.arpa).
-    Used while detecting reverse IP4 questions and answering these
+    Used while detecting reverse IPv4 questions and answering these
 */
-bool MDNSResponder::_buildDomainForReverseIP4(IPAddress p_IP4Address,
-        MDNSResponder::stcMDNS_RRDomain& p_rReverseIP4Domain) const
+bool MDNSResponder::_buildDomainForReverseIPv4(IPAddress p_IPv4Address,
+        MDNSResponder::stcMDNS_RRDomain& p_rReverseIPv4Domain) const
 {
 
-    bool    bResult = true;
+    bool    bResult = ((p_IPv4Address.isSet()) &&
+                       (p_IPv4Address.isV4()));
 
-    p_rReverseIP4Domain.clear();
+    p_rReverseIPv4Domain.clear();
 
     char    acBuffer[32];
-    for (int i = MDNS_IP4_SIZE; ((bResult) && (i >= 1)); --i)
+    for (int i = MDNS_IPV4_SIZE; ((bResult) && (i >= 1)); --i)
     {
-        itoa(p_IP4Address[i - 1], acBuffer, 10);
-        bResult = p_rReverseIP4Domain.addLabel(acBuffer);
+        itoa(p_IPv4Address[i - 1], acBuffer, 10);
+        bResult = p_rReverseIPv4Domain.addLabel(acBuffer);
     }
     bResult = ((bResult) &&
-               (p_rReverseIP4Domain.addLabel(scpcReverseIP4Domain)) &&
-               (p_rReverseIP4Domain.addLabel(scpcReverseTopDomain)) &&
-               (p_rReverseIP4Domain.addLabel(0)));
-    DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _buildDomainForReverseIP4: FAILED!\n")););
+               (p_rReverseIPv4Domain.addLabel(scpcReverseIPv4Domain)) &&
+               (p_rReverseIPv4Domain.addLabel(scpcReverseTopDomain)) &&
+               (p_rReverseIPv4Domain.addLabel(0)));
+    DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _buildDomainForReverseIPv4: FAILED!\n")););
     return bResult;
 }
 #endif
 
-#ifdef MDNS_IP6_SUPPORT
+#ifdef MDNS_IPV6_SUPPORT
 /*
-    MDNSResponder::_buildDomainForReverseIP6
+    MDNSResponder::_buildDomainForReverseIPv6
 
-    Used while detecting reverse IP6 questions and answering these
+    The IPv6 address is stringized by printing the 16 address bytes (32 nibbles) into a char buffer in reverse order
+    and adding 'ip6.arpa' (eg. 3.B.6.E.A.1.B.B.A.B.F.7.F.8.0.1.0.0.0.0.0.0.0.0.0.0.0.0.0.8.E.F.ip6.arpa).
+    Used while detecting reverse IPv6 questions and answering these
 */
-bool MDNSResponder::_buildDomainForReverseIP6(IPAddress p_IP4Address,
-        MDNSResponder::stcMDNS_RRDomain& p_rReverseIP6Domain) const
+bool MDNSResponder::_buildDomainForReverseIPv6(IPAddress p_IPv6Address,
+        MDNSResponder::stcMDNS_RRDomain& p_rReverseIPv6Domain) const
 {
-    // TODO: Implement
-    return false;
+
+    bool    bResult = ((p_IPv6Address.isSet()) &&
+                       (p_IPv6Address.isV6()));
+
+    p_rReverseIPv6Domain.clear();
+
+    const uint16_t* pRaw = p_IPv6Address.raw6();
+    for (int8_t i8 = (MDNS_IPV6_SIZE / 2); ((bResult) && (i8 > 0)); --i8) // 8..1
+    {
+        uint16_t	u16Part = ntohs(pRaw[i8 - 1] & 0xFFFF);
+        char        acBuffer[2];
+        for (uint8_t u8 = 0; ((bResult) && (u8 < 4)); ++u8)             // 0..3
+        {
+            itoa((u16Part & 0xF), acBuffer, 16);
+            bResult = p_rReverseIPv6Domain.addLabel(acBuffer);
+            u16Part >>= 4;
+        }
+    }
+    bResult = ((bResult) &&
+               (p_rReverseIPv6Domain.addLabel(scpcReverseIPv6Domain)) &&    // .ip6.arpa
+               (p_rReverseIPv6Domain.addLabel(scpcReverseTopDomain)) &&     // .local
+               (p_rReverseIPv6Domain.addLabel(0)));
+    DEBUG_EX_ERR(if (!bResult) DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _buildDomainForReverseIPv6: FAILED!\n")););
+    return bResult;
 }
 #endif
 
@@ -1366,6 +1658,7 @@ bool MDNSResponder::_writeMDNSRRDomain(const MDNSResponder::stcMDNS_RRDomain& p_
 */
 bool MDNSResponder::_writeMDNSHostDomain(const char* p_pcHostname,
         bool p_bPrependRDLength,
+        uint16_t p_u16AdditionalLength,
         MDNSResponder::stcMDNSSendParameter& p_rSendParameter)
 {
 
@@ -1377,13 +1670,13 @@ bool MDNSResponder::_writeMDNSHostDomain(const char* p_pcHostname,
                        // Found cached domain -> mark as compressed domain
                        ? ((MDNS_DOMAIN_COMPRESS_MARK > ((u16CachedDomainOffset >> 8) & ~MDNS_DOMAIN_COMPRESS_MARK)) && // Valid offset
                           ((!p_bPrependRDLength) ||
-                           (_write16(2, p_rSendParameter))) &&                                     // Length of 'Cxxx'
+                           (_write16((2 + p_u16AdditionalLength), p_rSendParameter))) &&                               // Length of 'Cxxx'
                           (_write8(((u16CachedDomainOffset >> 8) | MDNS_DOMAIN_COMPRESS_MARK), p_rSendParameter)) &&   // Compression mark (and offset)
                           (_write8((uint8_t)(u16CachedDomainOffset & 0xFF), p_rSendParameter)))
                        // No cached domain -> add this domain to cache and write full domain name
-                       : ((_buildDomainForHost(p_pcHostname, hostDomain)) &&                       // eg. esp8266.local
+                       : ((_buildDomainForHost(p_pcHostname, hostDomain)) &&                                           // eg. esp8266.local
                           ((!p_bPrependRDLength) ||
-                           (_write16(hostDomain.m_u16NameLength, p_rSendParameter))) &&            // RDLength (if needed)
+                           (_write16((hostDomain.m_u16NameLength + p_u16AdditionalLength), p_rSendParameter))) &&      // RDLength (if needed)
                           (p_rSendParameter.addDomainCacheItem((const void*)p_pcHostname, false, p_rSendParameter.m_u16Offset)) &&
                           (_writeMDNSRRDomain(hostDomain, p_rSendParameter))));
 
@@ -1410,6 +1703,7 @@ bool MDNSResponder::_writeMDNSHostDomain(const char* p_pcHostname,
 bool MDNSResponder::_writeMDNSServiceDomain(const MDNSResponder::stcMDNSService& p_Service,
         bool p_bIncludeName,
         bool p_bPrependRDLength,
+        uint16_t p_u16AdditionalLength,
         MDNSResponder::stcMDNSSendParameter& p_rSendParameter)
 {
 
@@ -1421,13 +1715,13 @@ bool MDNSResponder::_writeMDNSServiceDomain(const MDNSResponder::stcMDNSService&
                        // Found cached domain -> mark as compressed domain
                        ? ((MDNS_DOMAIN_COMPRESS_MARK > ((u16CachedDomainOffset >> 8) & ~MDNS_DOMAIN_COMPRESS_MARK)) && // Valid offset
                           ((!p_bPrependRDLength) ||
-                           (_write16(2, p_rSendParameter))) &&                                     // Lenght of 'Cxxx'
+                           (_write16((2 + p_u16AdditionalLength), p_rSendParameter))) &&                               // Lenght of 'Cxxx'
                           (_write8(((u16CachedDomainOffset >> 8) | MDNS_DOMAIN_COMPRESS_MARK), p_rSendParameter)) &&   // Compression mark (and offset)
                           (_write8((uint8_t)(u16CachedDomainOffset & 0xFF), p_rSendParameter)))
                        // No cached domain -> add this domain to cache and write full domain name
-                       : ((_buildDomainForService(p_Service, p_bIncludeName, serviceDomain)) &&    // eg. MyESP._http._tcp.local
+                       : ((_buildDomainForService(p_Service, p_bIncludeName, serviceDomain)) &&                        // eg. MyESP._http._tcp.local
                           ((!p_bPrependRDLength) ||
-                           (_write16(serviceDomain.m_u16NameLength, p_rSendParameter))) &&         // RDLength (if needed)
+                           (_write16((serviceDomain.m_u16NameLength + p_u16AdditionalLength), p_rSendParameter))) &&   // RDLength (if needed)
                           (p_rSendParameter.addDomainCacheItem((const void*)&p_Service, p_bIncludeName, p_rSendParameter.m_u16Offset)) &&
                           (_writeMDNSRRDomain(serviceDomain, p_rSendParameter))));
 
@@ -1466,7 +1760,7 @@ bool MDNSResponder::_writeMDNSQuestion(MDNSResponder::stcMDNS_RRQuestion& p_Ques
 }
 
 
-#ifdef MDNS_IP4_SUPPORT
+#ifdef MDNS_IPV4_SUPPORT
 /*
     MDNSResponder::_writeMDNSAnswer_A
 
@@ -1485,17 +1779,20 @@ bool MDNSResponder::_writeMDNSQuestion(MDNSResponder::stcMDNS_RRQuestion& p_Ques
 bool MDNSResponder::_writeMDNSAnswer_A(IPAddress p_IPAddress,
                                        MDNSResponder::stcMDNSSendParameter& p_rSendParameter)
 {
-    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_A (%s)\n"), p_IPAddress.toString().c_str()););
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_A (%s)%s\n"), p_IPAddress.toString().c_str(), (p_rSendParameter.m_bCacheFlush ? "" : " nF")););
 
     stcMDNS_RRAttributes    attributes(DNS_RRTYPE_A,
                                        ((p_rSendParameter.m_bCacheFlush ? 0x8000 : 0) | DNS_RRCLASS_IN));   // Cache flush? & INternet
-    const unsigned char     aucIPAddress[MDNS_IP4_SIZE] = { p_IPAddress[0], p_IPAddress[1], p_IPAddress[2], p_IPAddress[3] };
-    bool    bResult = ((_writeMDNSHostDomain(m_pcHostname, false, p_rSendParameter)) &&
+    const unsigned char     aucIPAddress[MDNS_IPV4_SIZE] = { p_IPAddress[0], p_IPAddress[1], p_IPAddress[2], p_IPAddress[3] };
+    bool    bResult = ((p_IPAddress.isV4()) &&
+                       (_writeMDNSHostDomain(m_pcHostname, false, 0, p_rSendParameter)) &&
                        (_writeMDNSRRAttributes(attributes, p_rSendParameter)) &&        // TYPE & CLASS
-                       (_write32((p_rSendParameter.m_bUnannounce ? 0 : MDNS_HOST_TTL), p_rSendParameter)) &&    // TTL
-                       (_write16(MDNS_IP4_SIZE, p_rSendParameter)) &&                   // RDLength
-                       (_udpAppendBuffer(aucIPAddress, MDNS_IP4_SIZE)) &&               // RData
-                       (p_rSendParameter.shiftOffset(MDNS_IP4_SIZE)));
+                       (_write32((p_rSendParameter.m_bUnannounce
+                                  ? 0
+                                  : (p_rSendParameter.m_bLegacyQuery ? MDNS_LEGACY_TTL : MDNS_HOST_TTL)), p_rSendParameter)) &&    // TTL
+                       (_write16(MDNS_IPV4_SIZE, p_rSendParameter)) &&                  // RDLength
+                       (_udpAppendBuffer(aucIPAddress, MDNS_IPV4_SIZE)) &&              // RData
+                       (p_rSendParameter.shiftOffset(MDNS_IPV4_SIZE)));
 
     DEBUG_EX_ERR(if (!bResult)
 {
@@ -1506,32 +1803,35 @@ bool MDNSResponder::_writeMDNSAnswer_A(IPAddress p_IPAddress,
 }
 
 /*
-    MDNSResponder::_writeMDNSAnswer_PTR_IP4
+    MDNSResponder::_writeMDNSAnswer_PTR_IPv4
 
-    Write a MDNS reverse IP4 PTR answer to the UDP output buffer.
+    Write a MDNS reverse IPv4 PTR answer to the UDP output buffer.
     See: '_writeMDNSAnswer_A'
 
     eg. 012.789.456.123.in-addr.arpa PTR 0x8001 120 15 esp8266.local
-    Used while answering reverse IP4 questions
+    Used while answering reverse IPv4 questions
 */
-bool MDNSResponder::_writeMDNSAnswer_PTR_IP4(IPAddress p_IPAddress,
+bool MDNSResponder::_writeMDNSAnswer_PTR_IPv4(IPAddress p_IPAddress,
         MDNSResponder::stcMDNSSendParameter& p_rSendParameter)
 {
-    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_PTR_IP4 (%s)\n"), p_IPAddress.toString().c_str()););
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_PTR_IPv4 (%s)%s\n"), p_IPAddress.toString().c_str(), (p_rSendParameter.m_bCacheFlush ? "" : " nF")););
 
-    stcMDNS_RRDomain        reverseIP4Domain;
+    stcMDNS_RRDomain        reverseIPv4Domain;
     stcMDNS_RRAttributes    attributes(DNS_RRTYPE_PTR,
                                        ((p_rSendParameter.m_bCacheFlush ? 0x8000 : 0) | DNS_RRCLASS_IN));   // Cache flush? & INternet
     stcMDNS_RRDomain        hostDomain;
-    bool    bResult = ((_buildDomainForReverseIP4(p_IPAddress, reverseIP4Domain)) &&    // 012.789.456.123.in-addr.arpa
-                       (_writeMDNSRRDomain(reverseIP4Domain, p_rSendParameter)) &&
+    bool    bResult = ((p_IPAddress.isV4()) &&
+                       (_buildDomainForReverseIPv4(p_IPAddress, reverseIPv4Domain)) &&	// 012.789.456.123.in-addr.arpa
+                       (_writeMDNSRRDomain(reverseIPv4Domain, p_rSendParameter)) &&
                        (_writeMDNSRRAttributes(attributes, p_rSendParameter)) &&        // TYPE & CLASS
-                       (_write32((p_rSendParameter.m_bUnannounce ? 0 : MDNS_HOST_TTL), p_rSendParameter)) &&    // TTL
-                       (_writeMDNSHostDomain(m_pcHostname, true, p_rSendParameter)));   // RDLength & RData (host domain, eg. esp8266.local)
+                       (_write32((p_rSendParameter.m_bUnannounce
+                                  ? 0
+                                  : (p_rSendParameter.m_bLegacyQuery ? MDNS_LEGACY_TTL : MDNS_HOST_TTL)), p_rSendParameter)) &&    // TTL
+                       (_writeMDNSHostDomain(m_pcHostname, true, 0, p_rSendParameter)));   // RDLength & RData (host domain, eg. esp8266.local)
 
     DEBUG_EX_ERR(if (!bResult)
 {
-    DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_PTR_IP4: FAILED!\n"));
+    DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_PTR_IPv4: FAILED!\n"));
     });
     return bResult;
 }
@@ -1554,12 +1854,14 @@ bool MDNSResponder::_writeMDNSAnswer_PTR_TYPE(MDNSResponder::stcMDNSService& p_r
 
     stcMDNS_RRDomain        dnssdDomain;
     stcMDNS_RRDomain        serviceDomain;
-    stcMDNS_RRAttributes    attributes(DNS_RRTYPE_PTR, DNS_RRCLASS_IN);	// No cache flush! only INternet
-    bool    bResult = ((_buildDomainForDNSSD(dnssdDomain)) &&                                   // _services._dns-sd._udp.local
+    stcMDNS_RRAttributes    attributes(DNS_RRTYPE_PTR, DNS_RRCLASS_IN);                    	// No cache flush for shared records! only INternet
+    bool    bResult = ((_buildDomainForDNSSD(dnssdDomain)) &&                               // _services._dns-sd._udp.local
                        (_writeMDNSRRDomain(dnssdDomain, p_rSendParameter)) &&
-                       (_writeMDNSRRAttributes(attributes, p_rSendParameter)) &&                // TYPE & CLASS
-                       (_write32((p_rSendParameter.m_bUnannounce ? 0 : MDNS_SERVICE_TTL), p_rSendParameter)) && // TTL
-                       (_writeMDNSServiceDomain(p_rService, false, true, p_rSendParameter)));   // RDLength & RData (service domain, eg. _http._tcp.local)
+                       (_writeMDNSRRAttributes(attributes, p_rSendParameter)) &&            // TYPE & CLASS
+                       (_write32((p_rSendParameter.m_bUnannounce
+                                  ? 0
+                                  : (p_rSendParameter.m_bLegacyQuery ? MDNS_LEGACY_TTL : MDNS_SERVICE_TTL)), p_rSendParameter)) && // TTL
+                       (_writeMDNSServiceDomain(p_rService, false, true, 0, p_rSendParameter)));    // RDLength & RData (service domain, eg. _http._tcp.local)
 
     DEBUG_EX_ERR(if (!bResult)
 {
@@ -1583,11 +1885,13 @@ bool MDNSResponder::_writeMDNSAnswer_PTR_NAME(MDNSResponder::stcMDNSService& p_r
 {
     DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_PTR_NAME\n")););
 
-    stcMDNS_RRAttributes    attributes(DNS_RRTYPE_PTR, DNS_RRCLASS_IN);	// No cache flush! only INternet
-    bool    bResult = ((_writeMDNSServiceDomain(p_rService, false, false, p_rSendParameter)) && // _http._tcp.local
+    stcMDNS_RRAttributes    attributes(DNS_RRTYPE_PTR, DNS_RRCLASS_IN);	                            // No cache flush for shared records! only INternet
+    bool    bResult = ((_writeMDNSServiceDomain(p_rService, false, false, 0, p_rSendParameter)) &&  // _http._tcp.local
                        (_writeMDNSRRAttributes(attributes, p_rSendParameter)) &&                    // TYPE & CLASS
-                       (_write32((p_rSendParameter.m_bUnannounce ? 0 : MDNS_SERVICE_TTL), p_rSendParameter)) && // TTL
-                       (_writeMDNSServiceDomain(p_rService, true, true, p_rSendParameter)));        // RDLength & RData (service domain, eg. MyESP._http._tcp.local)
+                       (_write32((p_rSendParameter.m_bUnannounce
+                                  ? 0
+                                  : (p_rSendParameter.m_bLegacyQuery ? MDNS_LEGACY_TTL : MDNS_SERVICE_TTL)), p_rSendParameter)) && // TTL
+                       (_writeMDNSServiceDomain(p_rService, true, true, 0, p_rSendParameter)));     // RDLength & RData (service domain, eg. MyESP._http._tcp.local)
 
     DEBUG_EX_ERR(if (!bResult)
 {
@@ -1611,7 +1915,7 @@ bool MDNSResponder::_writeMDNSAnswer_PTR_NAME(MDNSResponder::stcMDNSService& p_r
 bool MDNSResponder::_writeMDNSAnswer_TXT(MDNSResponder::stcMDNSService& p_rService,
         MDNSResponder::stcMDNSSendParameter& p_rSendParameter)
 {
-    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_TXT\n")););
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_TXT%s\n"), (p_rSendParameter.m_bCacheFlush ? "" : " nF")););
 
     bool                    bResult = false;
 
@@ -1619,9 +1923,11 @@ bool MDNSResponder::_writeMDNSAnswer_TXT(MDNSResponder::stcMDNSService& p_rServi
                                        ((p_rSendParameter.m_bCacheFlush ? 0x8000 : 0) | DNS_RRCLASS_IN));   // Cache flush? & INternet
 
     if ((_collectServiceTxts(p_rService)) &&
-            (_writeMDNSServiceDomain(p_rService, true, false, p_rSendParameter)) &&     // MyESP._http._tcp.local
+            (_writeMDNSServiceDomain(p_rService, true, false, 0, p_rSendParameter)) &&	// MyESP._http._tcp.local
             (_writeMDNSRRAttributes(attributes, p_rSendParameter)) &&                   // TYPE & CLASS
-            (_write32((p_rSendParameter.m_bUnannounce ? 0 : MDNS_SERVICE_TTL), p_rSendParameter)) &&    // TTL
+            (_write32((p_rSendParameter.m_bUnannounce
+                       ? 0
+                       : (p_rSendParameter.m_bLegacyQuery ? MDNS_LEGACY_TTL : MDNS_SERVICE_TTL)), p_rSendParameter)) &&    // TTL
             (_write16(p_rService.m_Txts.length(), p_rSendParameter)))                   // RDLength
     {
 
@@ -1655,12 +1961,12 @@ bool MDNSResponder::_writeMDNSAnswer_TXT(MDNSResponder::stcMDNSService& p_rServi
     return bResult;
 }
 
-#ifdef MDNS_IP6_SUPPORT
+#ifdef MDNS_IPV6_SUPPORT
 /*
     MDNSResponder::_writeMDNSAnswer_AAAA
 
     Write a MDNS AAAA answer to the UDP output buffer.
-    See: '_writeMDNSAnswer_A'
+    See: '_writeMDNSAnswer_AAAA'
 
     eg. esp8266.local AAAA 0x8001 120 16 xxxx::xx
     http://www.zytrax.com/books/dns/ch8/aaaa.html
@@ -1668,15 +1974,19 @@ bool MDNSResponder::_writeMDNSAnswer_TXT(MDNSResponder::stcMDNSService& p_rServi
 bool MDNSResponder::_writeMDNSAnswer_AAAA(IPAddress p_IPAddress,
         MDNSResponder::stcMDNSSendParameter& p_rSendParameter)
 {
-    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_AAAA\n")););
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_AAAA (%s)%s\n"), p_IPAddress.toString().c_str(), (p_rSendParameter.m_bCacheFlush ? "" : " nF")););
 
     stcMDNS_RRAttributes    attributes(DNS_RRTYPE_AAAA,
                                        ((p_rSendParameter.m_bCacheFlush ? 0x8000 : 0) | DNS_RRCLASS_IN));   // Cache flush? & INternet
-    bool    bResult = ((_writeMDNSHostDomain(m_pcHostname, false, p_rSendParameter)) && // esp8266.local
+    bool    bResult = ((p_IPAddress.isV6()) &&
+                       (_writeMDNSHostDomain(m_pcHostname, false, 0, p_rSendParameter)) &&	// esp8266.local
                        (_writeMDNSRRAttributes(attributes, p_rSendParameter)) &&            // TYPE & CLASS
-                       (_write32((p_rSendParameter.m_bUnannounce ? 0 : MDNS_HOST_TTL), p_rSendParameter)) &&    // TTL
-                       (_write16(MDNS_IP6_SIZE, p_rSendParameter)) &&                       // RDLength
-                       (false /*TODO: IP6 version of: _udpAppendBuffer((uint32_t)p_IPAddress, MDNS_IP4_SIZE)*/));   // RData
+                       (_write32((p_rSendParameter.m_bUnannounce
+                                  ? 0
+                                  : (p_rSendParameter.m_bLegacyQuery ? MDNS_LEGACY_TTL : MDNS_HOST_TTL)), p_rSendParameter)) &&    // TTL
+                       (_write16(MDNS_IPV6_SIZE, p_rSendParameter)) &&                     	// RDLength
+                       (_udpAppendBuffer((uint8_t*)p_IPAddress.raw6(), MDNS_IPV6_SIZE)) &&   // RData
+                       (p_rSendParameter.shiftOffset(MDNS_IPV6_SIZE)));
 
     DEBUG_EX_ERR(if (!bResult)
 {
@@ -1686,31 +1996,34 @@ bool MDNSResponder::_writeMDNSAnswer_AAAA(IPAddress p_IPAddress,
 }
 
 /*
-    MDNSResponder::_writeMDNSAnswer_PTR_IP6
+    MDNSResponder::_writeMDNSAnswer_PTR_IPv6
 
-    Write a MDNS reverse IP6 PTR answer to the UDP output buffer.
-    See: '_writeMDNSAnswer_A'
+    Write a MDNS reverse IPv6 PTR answer to the UDP output buffer.
+    See: '_writeMDNSAnswer_AAAA'
 
-    eg. xxxx::xx.in6.arpa PTR 0x8001 120 15 esp8266.local
-    Used while answering reverse IP6 questions
+    eg. xxxx::xx.ip6.arpa PTR 0x8001 120 15 esp8266.local
+    Used while answering reverse IPv6 questions
 */
-bool MDNSResponder::_writeMDNSAnswer_PTR_IP6(IPAddress p_IPAddress,
+bool MDNSResponder::_writeMDNSAnswer_PTR_IPv6(IPAddress p_IPAddress,
         MDNSResponder::stcMDNSSendParameter& p_rSendParameter)
 {
-    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_PTR_IP6\n")););
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_PTR_IPv6%s\n"), (p_rSendParameter.m_bCacheFlush ? "" : " nF")););
 
-    stcMDNS_RRDomain        reverseIP6Domain;
+    stcMDNS_RRDomain        reverseIPv6Domain;
     stcMDNS_RRAttributes    attributes(DNS_RRTYPE_PTR,
                                        ((p_rSendParameter.m_bCacheFlush ? 0x8000 : 0) | DNS_RRCLASS_IN));   // Cache flush? & INternet
-    bool    bResult = ((_buildDomainForReverseIP6(p_IPAddress, reverseIP6Domain)) &&        // xxxx::xx.ip6.arpa
-                       (_writeMDNSRRDomain(reverseIP6Domain, p_rSendParameter)) &&
+    bool    bResult = ((p_IPAddress.isV6()) &&
+                       (_buildDomainForReverseIPv6(p_IPAddress, reverseIPv6Domain)) &&		// xxxx::xx.ip6.arpa
+                       (_writeMDNSRRDomain(reverseIPv6Domain, p_rSendParameter)) &&
                        (_writeMDNSRRAttributes(attributes, p_rSendParameter)) &&            // TYPE & CLASS
-                       (_write32((p_rSendParameter.m_bUnannounce ? 0 : MDNS_HOST_TTL), p_rSendParameter)) &&    // TTL
-                       (_writeMDNSHostDomain(m_pcHostname, true, p_rSendParameter)));       // RDLength & RData (host domain, eg. esp8266.local)
+                       (_write32((p_rSendParameter.m_bUnannounce
+                                  ? 0
+                                  : (p_rSendParameter.m_bLegacyQuery ? MDNS_LEGACY_TTL : MDNS_HOST_TTL)), p_rSendParameter)) &&    // TTL
+                       (_writeMDNSHostDomain(m_pcHostname, true, 0, p_rSendParameter)));  	// RDLength & RData (host domain, eg. esp8266.local)
 
     DEBUG_EX_ERR(if (!bResult)
 {
-    DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_PTR_IP6: FAILED!\n"));
+    DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_PTR_IPv6: FAILED!\n"));
     });
     return bResult;
 }
@@ -1725,7 +2038,7 @@ bool MDNSResponder::_writeMDNSAnswer_PTR_IP6(IPAddress p_IPAddress,
 bool MDNSResponder::_writeMDNSAnswer_SRV(MDNSResponder::stcMDNSService& p_rService,
         MDNSResponder::stcMDNSSendParameter& p_rSendParameter)
 {
-    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_SRV\n")););
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_SRV%s\n"), (p_rSendParameter.m_bCacheFlush ? "" : " nF")););
 
     uint16_t                u16CachedDomainOffset = (p_rSendParameter.m_bLegacyQuery
             ? 0
@@ -1734,9 +2047,11 @@ bool MDNSResponder::_writeMDNSAnswer_SRV(MDNSResponder::stcMDNSService& p_rServi
     stcMDNS_RRAttributes    attributes(DNS_RRTYPE_SRV,
                                        ((p_rSendParameter.m_bCacheFlush ? 0x8000 : 0) | DNS_RRCLASS_IN));   // Cache flush? & INternet
     stcMDNS_RRDomain        hostDomain;
-    bool    bResult = ((_writeMDNSServiceDomain(p_rService, true, false, p_rSendParameter)) &&  // MyESP._http._tcp.local
+    bool    bResult = ((_writeMDNSServiceDomain(p_rService, true, false, 0, p_rSendParameter)) &&  // MyESP._http._tcp.local
                        (_writeMDNSRRAttributes(attributes, p_rSendParameter)) &&                // TYPE & CLASS
-                       (_write32((p_rSendParameter.m_bUnannounce ? 0 : MDNS_SERVICE_TTL), p_rSendParameter)) && // TTL
+                       (_write32((p_rSendParameter.m_bUnannounce
+                                  ? 0
+                                  : (p_rSendParameter.m_bLegacyQuery ? MDNS_LEGACY_TTL : MDNS_HOST_TTL/*MDNS_SERVICE_TTL*/)), p_rSendParameter)) && // TTL
                        (!u16CachedDomainOffset
                         // No cache for domain name (or no compression allowed)
                         ? ((_buildDomainForHost(m_pcHostname, hostDomain)) &&
@@ -1764,6 +2079,226 @@ bool MDNSResponder::_writeMDNSAnswer_SRV(MDNSResponder::stcMDNSService& p_rServi
     DEBUG_EX_ERR(if (!bResult)
 {
     DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_SRV: FAILED!\n"));
+    });
+    return bResult;
+}
+
+/*
+    MDNSResponder::_createNSECBitmap
+*/
+MDNSResponder::stcMDNS_NSECBitmap* MDNSResponder::_createNSECBitmap(uint32_t p_u32NSECContent)
+{
+
+    // Currently 6 bytes (6*8 -> 0..47) are long enough, and only this is implemented
+    stcMDNS_NSECBitmap* pNSECBitmap = new stcMDNS_NSECBitmap;
+    if (pNSECBitmap)
+    {
+        if (p_u32NSECContent & static_cast<uint32_t>(enuContentFlag::A))
+        {
+            pNSECBitmap->setBit(DNS_RRTYPE_A);      // 01/0x01
+        }
+        if ((p_u32NSECContent & static_cast<uint32_t>(enuContentFlag::PTR_IPv4)) ||
+                (p_u32NSECContent & static_cast<uint32_t>(enuContentFlag::PTR_IPv6)))
+        {
+
+            pNSECBitmap->setBit(DNS_RRTYPE_PTR);    // 12/0x0C
+        }
+        if (p_u32NSECContent & static_cast<uint32_t>(enuContentFlag::AAAA))
+        {
+            pNSECBitmap->setBit(DNS_RRTYPE_AAAA);   // 28/0x1C
+        }
+        if (p_u32NSECContent & static_cast<uint32_t>(enuContentFlag::TXT))
+        {
+            pNSECBitmap->setBit(DNS_RRTYPE_TXT);    // 16/0x10
+        }
+        if (p_u32NSECContent & static_cast<uint32_t>(enuContentFlag::SRV))
+        {
+            pNSECBitmap->setBit(DNS_RRTYPE_SRV);    // 33/0x21
+        }
+        if (p_u32NSECContent & static_cast<uint32_t>(enuContentFlag::NSEC))
+        {
+            pNSECBitmap->setBit(DNS_RRTYPE_NSEC);   // 47/0x2F
+        }
+    }
+    return pNSECBitmap;
+}
+
+/*
+    MDNSResponder::_writeMDNSNSECBitmap
+*/
+bool MDNSResponder::_writeMDNSNSECBitmap(const MDNSResponder::stcMDNS_NSECBitmap& p_NSECBitmap,
+        MDNSResponder::stcMDNSSendParameter& p_rSendParameter)
+{
+    /*  DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("_writeMDNSNSECBitmap: "));
+    			  for (uint16_t u=0; u<p_NSECBitmap.m_u16BitmapLength; ++u) {
+    				  DEBUG_OUTPUT.printf_P(PSTR("0x%02X "), p_NSECBitmap.m_pu8BitmapData[u]);
+    			  }
+    			  DEBUG_OUTPUT.printf_P(PSTR("\n"));
+    			 );*/
+
+    bool    bResult = ((_write16(p_NSECBitmap.length(), p_rSendParameter)) &&
+                       ((_udpAppendBuffer(p_NSECBitmap.m_au8BitmapData, p_NSECBitmap.length())) &&
+                        (p_rSendParameter.shiftOffset(p_NSECBitmap.length()))));
+    DEBUG_EX_ERR(if (!bResult)
+{
+    DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSNSECBitmap: FAILED!\n"));
+    });
+    return bResult;
+}
+
+/*
+    MDNSResponder::_writeMDNSAnswer_NSEC(host)
+
+    eg. esp8266.local NSEC 0x8001 120 XX esp8266.local xxx
+    http://www.zytrax.com/books/dns/ch8/nsec.html
+*/
+bool MDNSResponder::_writeMDNSAnswer_NSEC(uint32_t p_u32NSECContent,
+        MDNSResponder::stcMDNSSendParameter& p_rSendParameter)
+{
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_NSEC (host: %s)%s\n"), _replyFlags2String(p_u32NSECContent), (p_rSendParameter.m_bCacheFlush ? "" : " nF")););
+
+    stcMDNS_RRAttributes    attributes(DNS_RRTYPE_NSEC,
+                                       ((p_rSendParameter.m_bCacheFlush ? 0x8000 : 0) | DNS_RRCLASS_IN));       // Cache flush? & INternet
+    stcMDNS_NSECBitmap*     pNSECBitmap = _createNSECBitmap(p_u32NSECContent);
+    bool    bResult = ((pNSECBitmap) &&                                                                         // NSEC bitmap created
+                       (_writeMDNSHostDomain(m_pcHostname, false, 0, p_rSendParameter)) &&                      // esp8266.local
+                       (_writeMDNSRRAttributes(attributes, p_rSendParameter)) &&                                // TYPE & CLASS
+                       (_write32((p_rSendParameter.m_bUnannounce
+                                  ? 0
+                                  : (p_rSendParameter.m_bLegacyQuery ? MDNS_LEGACY_TTL : MDNS_HOST_TTL)), p_rSendParameter)) &&    // TTL
+                       (_writeMDNSHostDomain(m_pcHostname, true, (2 + pNSECBitmap->length()), p_rSendParameter)) && // XX esp8266.local
+                       (_writeMDNSNSECBitmap(*pNSECBitmap, p_rSendParameter)));                                 // NSEC bitmap
+    if (pNSECBitmap)
+    {
+        delete pNSECBitmap;
+        pNSECBitmap = 0;
+    }
+
+    DEBUG_EX_ERR(if (!bResult)
+{
+    DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_NSEC (host): FAILED!\n"));
+    });
+    return bResult;
+}
+
+
+#ifdef MDNS_IPV4_SUPPORT
+/*
+    MDNSResponder::_writeMDNSAnswer_NSEC_PTR_IPv4(host)
+
+    eg. 012.789.456.123.in-addr.arpa NSEC 0x8001 120 XX 012.789.456.123.in-addr.arpa xxx
+    http://www.zytrax.com/books/dns/ch8/nsec.html
+*/
+bool MDNSResponder::_writeMDNSAnswer_NSEC_PTR_IPv4(IPAddress p_IPAddress,
+        stcMDNSSendParameter& p_rSendParameter)
+{
+
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_NSEC_PTR_IPv4\n")););
+
+    stcMDNS_RRAttributes    attributes(DNS_RRTYPE_NSEC,
+                                       ((p_rSendParameter.m_bCacheFlush ? 0x8000 : 0) | DNS_RRCLASS_IN));       // Cache flush? & INternet
+    stcMDNS_NSECBitmap*     pNSECBitmap = _createNSECBitmap(static_cast<uint32_t>(enuContentFlag::PTR_IPv4));
+    stcMDNS_RRDomain        reverseIPv4Domain;
+    bool    bResult = ((p_IPAddress.isV4()) &&
+                       (pNSECBitmap) &&                                                                 // NSEC bitmap created
+                       (_buildDomainForReverseIPv4(p_IPAddress, reverseIPv4Domain)) &&                  // 012.789.456.123.in-addr.arpa
+                       (_writeMDNSRRDomain(reverseIPv4Domain, p_rSendParameter)) &&                     // 012.789.456.123.in-addr.arpa
+                       (_writeMDNSRRAttributes(attributes, p_rSendParameter)) &&                        // TYPE & CLASS
+                       (_write32((p_rSendParameter.m_bUnannounce
+                                  ? 0
+                                  : (p_rSendParameter.m_bLegacyQuery ? MDNS_LEGACY_TTL : MDNS_HOST_TTL)), p_rSendParameter)) &&    // TTL
+                       (_write16((reverseIPv4Domain.m_u16NameLength + (2 + pNSECBitmap->length())), p_rSendParameter)) &&
+                       (_writeMDNSRRDomain(reverseIPv4Domain, p_rSendParameter)) &&                 	// 012.789.456.123.in-addr.arpa
+                       (_writeMDNSNSECBitmap(*pNSECBitmap, p_rSendParameter)));                         // NSEC bitmap
+    if (pNSECBitmap)
+    {
+        delete pNSECBitmap;
+        pNSECBitmap = 0;
+    }
+
+    DEBUG_EX_ERR(if (!bResult)
+{
+    DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_NSEC_PTR_IPv4 (host): FAILED!\n"));
+    });
+    return bResult;
+}
+#endif
+
+
+#ifdef MDNS_IPV6_SUPPORT
+/*
+    MDNSResponder::_writeMDNSAnswer_NSEC_PTR_IPv6(host)
+
+    eg. 9.0.0.0.0.0.0.0.0.0.0.0.0.7.8.5.6.3.4.1.2.ip6.arpa NSEC 0x8001 120 XX 9.0.0.0.0.0.0.0.0.0.0.0.0.7.8.5.6.3.4.1.2.ip6.arpa xxx
+    http://www.zytrax.com/books/dns/ch8/nsec.html
+*/
+bool MDNSResponder::_writeMDNSAnswer_NSEC_PTR_IPv6(IPAddress p_IPAddress,
+        stcMDNSSendParameter& p_rSendParameter)
+{
+
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_NSEC_PTR_IPv6\n")););
+
+    stcMDNS_RRAttributes    attributes(DNS_RRTYPE_NSEC,
+                                       ((p_rSendParameter.m_bCacheFlush ? 0x8000 : 0) | DNS_RRCLASS_IN));       // Cache flush? & INternet
+    stcMDNS_NSECBitmap*     pNSECBitmap = _createNSECBitmap(static_cast<uint32_t>(enuContentFlag::PTR_IPv6));
+    stcMDNS_RRDomain        reverseIPv6Domain;
+    bool    bResult = ((p_IPAddress.isV6()) &&
+                       (pNSECBitmap) &&                                                                 // NSEC bitmap created
+                       (_buildDomainForReverseIPv6(p_IPAddress, reverseIPv6Domain)) &&                  // 9.0.0.0.0.0.0.0.0.0.0.0.0.7.8.5.6.3.4.1.2.ip6.arpa
+                       (_writeMDNSRRDomain(reverseIPv6Domain, p_rSendParameter)) &&                     // 9.0.0.0.0.0.0.0.0.0.0.0.0.7.8.5.6.3.4.1.2.ip6.arpa
+                       (_writeMDNSRRAttributes(attributes, p_rSendParameter)) &&                        // TYPE & CLASS
+                       (_write32((p_rSendParameter.m_bUnannounce
+                                  ? 0
+                                  : (p_rSendParameter.m_bLegacyQuery ? MDNS_LEGACY_TTL : MDNS_HOST_TTL)), p_rSendParameter)) &&    // TTL
+                       (_write16((reverseIPv6Domain.m_u16NameLength + (2 + pNSECBitmap->length())), p_rSendParameter)) &&
+                       (_writeMDNSRRDomain(reverseIPv6Domain, p_rSendParameter)) &&                     // 9.0.0.0.0.0.0.0.0.0.0.0.0.7.8.5.6.3.4.1.2.ip6.arpa
+                       (_writeMDNSNSECBitmap(*pNSECBitmap, p_rSendParameter)));                         // NSEC bitmap
+    if (pNSECBitmap)
+    {
+        delete pNSECBitmap;
+        pNSECBitmap = 0;
+    }
+
+    DEBUG_EX_ERR(if (!bResult)
+{
+    DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_NSEC_PTR_IPv6 (host): FAILED!\n"));
+    });
+    return bResult;
+}
+#endif
+
+/*
+    MDNSResponder::_writeMDNSAnswer_NSEC(service)
+
+    eg. MyESP._http.tcp.local NSEC 0x8001 4500 XX MyESP._http.tcp.local xxx
+    http://www.zytrax.com/books/dns/ch8/nsec.html
+*/
+bool MDNSResponder::_writeMDNSAnswer_NSEC(MDNSResponder::stcMDNSService& p_rService,
+        uint32_t p_u32NSECContent,
+        MDNSResponder::stcMDNSSendParameter& p_rSendParameter)
+{
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_NSEC (service: %s)\n"), _replyFlags2String(p_u32NSECContent)););
+
+    stcMDNS_RRAttributes    attributes(DNS_RRTYPE_NSEC,
+                                       ((p_rSendParameter.m_bCacheFlush ? 0x8000 : 0) | DNS_RRCLASS_IN));       // Cache flush? & INternet
+    stcMDNS_NSECBitmap*     pNSECBitmap = _createNSECBitmap(p_u32NSECContent);
+    bool    bResult = ((pNSECBitmap) &&                                                                         // NSEC bitmap created
+                       (_writeMDNSServiceDomain(p_rService, true, false, 0, p_rSendParameter)) &&               // MyESP._http._tcp.local
+                       (_writeMDNSRRAttributes(attributes, p_rSendParameter)) &&                                // TYPE & CLASS
+                       (_write32((p_rSendParameter.m_bUnannounce
+                                  ? 0
+                                  : (p_rSendParameter.m_bLegacyQuery ? MDNS_LEGACY_TTL : MDNS_SERVICE_TTL)), p_rSendParameter)) && // TTL
+                       (_writeMDNSServiceDomain(p_rService, true, true, (2 + pNSECBitmap->length()), p_rSendParameter)) && // XX MyESP._http._tcp.local
+                       (_writeMDNSNSECBitmap(*pNSECBitmap, p_rSendParameter)));                                 // NSEC bitmap
+    if (pNSECBitmap)
+    {
+        delete pNSECBitmap;
+        pNSECBitmap = 0;
+    }
+
+    DEBUG_EX_ERR(if (!bResult)
+{
+    DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _writeMDNSAnswer_NSEC (service): FAILED!\n"));
     });
     return bResult;
 }

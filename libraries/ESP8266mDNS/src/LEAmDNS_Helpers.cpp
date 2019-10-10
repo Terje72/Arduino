@@ -22,7 +22,11 @@
 
 */
 
+#include <Schedule.h>
+
+#include "lwip/netif.h"
 #include "lwip/igmp.h"
+#include "lwip/mld6.h"
 
 #include "LEAmDNS_lwIPdefs.h"
 #include "LEAmDNS_Priv.h"
@@ -109,13 +113,13 @@ namespace MDNSImplementation
     if (p_rpcDomain)
     {
         const char* pFoundDivider = strrstr(p_rpcDomain, pcDivider);
-        if (pFoundDivider)      // maybe already extended
+        if (pFoundDivider)          // maybe already extended
         {
             char*         pEnd = 0;
             unsigned long ulIndex = strtoul((pFoundDivider + strlen(pcDivider)), &pEnd, 10);
             if ((ulIndex) &&
                     ((pEnd - p_rpcDomain) == (ptrdiff_t)strlen(p_rpcDomain)) &&
-                    (!*pEnd))         // Valid (old) index found
+                    (!*pEnd))           // Valid (old) index found
             {
 
                 char    acIndexBuffer[16];
@@ -144,7 +148,7 @@ namespace MDNSImplementation
             }
         }
 
-        if (!pFoundDivider)     // not yet extended (or failed to increment extension) -> start indexing
+        if (!pFoundDivider)         // not yet extended (or failed to increment extension) -> start indexing
         {
             size_t    stLength = strlen(p_rpcDomain) + (strlen(pcDivider) + 1 + 1);   // Name + Divider + '2' + '\0'
             char*     pNewHostname = new char[stLength];
@@ -186,12 +190,153 @@ namespace MDNSImplementation
 
 
 /*
+    MDNSResponder::setStationHostname (static)
+
+    Sets the staion hostname
+
+*/
+/*static*/ bool MDNSResponder::setStationHostname(const char* p_pcHostname)
+{
+
+    if (p_pcHostname)
+    {
+        WiFi.hostname(p_pcHostname);
+        DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] MDNSResponder::setStationHostname host name: %s!\n"), p_pcHostname););
+    }
+    return true;
+}
+
+
+/*
+    MDNSResponder::_attachNetIf
+*/
+bool MDNSResponder::_attachNetIf(netif* p_pNetIf)
+{
+
+    bool	bResult = false;
+
+    if ((p_pNetIf) &&
+            (!m_pNetIf))
+    {
+
+        bResult = true;
+
+        // Set instance's netif
+        m_pNetIf = p_pNetIf;
+        DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] MDNSResponder::_attachNetIf: Set m_pNetIf %u (%s)!\n"), netif_get_index(m_pNetIf), IPAddress(netif_ip4_addr(m_pNetIf)).toString().c_str()););
+
+        if (STATION_IF == m_pNetIf->num)
+        {
+            m_GotIPHandler = WiFi.onStationModeGotIP([this](const WiFiEventStationModeGotIP & pEvent)
+            {
+                (void) pEvent;
+                // Ensure that _restart() runs in USER context
+                schedule_function([this]()
+                {
+                    MDNSResponder::_restart();
+                });
+            });
+            m_DisconnectedHandler = WiFi.onStationModeDisconnected([this](const WiFiEventStationModeDisconnected & pEvent)
+            {
+                (void) pEvent;
+                // Ensure that _restart() runs in USER context
+                schedule_function([this]()
+                {
+                    MDNSResponder::_restart();
+                });
+            });
+        }
+
+        // Join multicast group(s)
+#ifdef MDNS_IPV4_SUPPORT
+        ip_addr_t   multicast_addr_V4 = DNS_MQUERY_IPV4_GROUP_INIT;
+        if (!(m_pNetIf->flags & NETIF_FLAG_IGMP))
+        {
+            DEBUG_EX_ERR(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _attachNetIf: Setting flag: flags & NETIF_FLAG_IGMP\n")););
+            m_pNetIf->flags |= NETIF_FLAG_IGMP;
+
+            if (ERR_OK != igmp_start(m_pNetIf))
+            {
+                DEBUG_EX_ERR(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _attachNetIf: igmp_start FAILED!\n")););
+            }
+        }
+        /*  else {
+            DEBUG_EX_ERR(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _attachNetIf: NETIF_FLAG_IGMP flag set\n")); );
+            }*/
+
+        bResult = ((bResult) &&
+                   (ERR_OK == igmp_joingroup_netif(m_pNetIf, ip_2_ip4(&multicast_addr_V4))));
+        DEBUG_EX_ERR(if (!bResult)
+    {
+        DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _attachNetIf: igmp_joingroup_netif(%s) FAILED!\n"), IPAddress(multicast_addr_V4).toString().c_str());
+        });
+#endif
+
+#ifdef MDNS_IPV6_SUPPORT
+        ip_addr_t   multicast_addr_V6 = DNS_MQUERY_IPV6_GROUP_INIT;
+        bResult = ((bResult) &&
+                   (ERR_OK == mld6_joingroup_netif(m_pNetIf, ip_2_ip6(&multicast_addr_V6))));
+        DEBUG_EX_ERR(if (!bResult)
+    {
+        DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _attachNetIf: mld6_joingroup_netif FAILED!\n"));
+        });
+#endif
+
+        DEBUG_EX_ERR(if (!bResult)
+    {
+        DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _attachNetIf: FAILED!\n"));
+        });
+    }
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] MDNSResponder::_attachNetIf: Attaching to netif %s!\n"), (bResult ? "succeeded" : "FAILED")););
+    return bResult;
+}
+
+/*
+    MDNSResponder::_detachNetIf
+*/
+bool MDNSResponder::_detachNetIf(void)
+{
+
+    bool	bResult = false;
+
+    if (m_pNetIf)
+    {
+
+        // Leave multicast group(s)
+        bResult = true;
+#ifdef MDNS_IPV4_SUPPORT
+        ip_addr_t   multicast_addr_V4 = DNS_MQUERY_IPV4_GROUP_INIT;
+        bResult = ((bResult) &&
+                   (ERR_OK == igmp_leavegroup_netif(m_pNetIf, ip_2_ip4(&multicast_addr_V4)/*(const struct ip4_addr *)&multicast_addr_V4.u_addr.ip4*/)));
+#endif
+#ifdef MDNS_IPV6_SUPPORT
+        ip_addr_t   multicast_addr_V6 = DNS_MQUERY_IPV6_GROUP_INIT;
+        bResult = ((bResult) &&
+                   (ERR_OK == mld6_leavegroup_netif(m_pNetIf, ip_2_ip6(&multicast_addr_V6)/*&(multicast_addr_V6.u_addr.ip6)*/)));
+#endif
+
+        if (m_pNetIf->num = STATION_IF)
+        {
+            // Reset WiFi event callbacks
+            m_GotIPHandler.reset();
+            m_DisconnectedHandler.reset();
+        }
+
+        // Remove instance's netif
+        m_pNetIf = 0;
+    }
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] MDNSResponder::_detachNetIf: Detaching from netif %s!\n"), (bResult ? "succeeded" : "FAILED")););
+    return bResult;
+}
+
+
+/*
     UDP CONTEXT
 */
 
 bool MDNSResponder::_callProcess(void)
 {
-    DEBUG_EX_INFO(DEBUG_OUTPUT.printf("[MDNSResponder] _callProcess (%lu, triggered by: %s)\n", millis(), IPAddress(m_pUDPContext->getRemoteAddress()).toString().c_str()););
+    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _callProcess (%lu)\n"), millis()););
 
     return _process(false);
 }
@@ -200,9 +345,9 @@ bool MDNSResponder::_callProcess(void)
     MDNSResponder::_allocUDPContext
 
     (Re-)Creates the one-and-only UDP context for the MDNS responder.
-    The context is added to the 'multicast'-group and listens to the MDNS port (5353).
-    The travel-distance for multicast messages is set to 1 (local, via MDNS_MULTICAST_TTL).
-    Messages are received via the MDNSResponder '_update' function. CAUTION: This function
+    The context listens to the MDNS port (5353).
+    The travel-distance for multicast messages is set to 1/255 (via MDNS_MULTICAST_TTL).
+    Messages are received via the MDNSResponder '_callProcess' function. CAUTION: This function
     is called from the WiFi stack side of the ESP stack system.
 
 */
@@ -214,24 +359,50 @@ bool MDNSResponder::_allocUDPContext(void)
 
     _releaseUDPContext();
 
-#ifdef MDNS_IP4_SUPPORT
-    ip_addr_t   multicast_addr = DNS_MQUERY_IPV4_GROUP_INIT;
-#endif
-#ifdef MDNS_IP6_SUPPORT
-    //TODO: set multicast address (lwip_joingroup() is IPv4 only at the time of writing)
-    multicast_addr.addr = DNS_MQUERY_IPV6_GROUP_INIT;
-#endif
-    if (ERR_OK == igmp_joingroup(ip_2_ip4(&m_netif->ip_addr), ip_2_ip4(&multicast_addr)))
+    if ((!m_pUDPContext) &&
+            (m_pNetIf) &&
+            (netif_is_link_up(m_pNetIf)))
     {
-        m_pUDPContext = new UdpContext;
-        m_pUDPContext->ref();
 
-        if (m_pUDPContext->listen(IP4_ADDR_ANY, DNS_MQUERY_PORT))
+        bool	bHasAnyIPAddress = false;
+#ifdef MDNS_IPV4_SUPPORT
+        bHasAnyIPAddress |= _getResponderIPAddress(enuIPProtocolType::V4).isSet();
+#endif
+#ifdef MDNS_IPV6_SUPPORT
+        bHasAnyIPAddress |= _getResponderIPAddress(enuIPProtocolType::V6).isSet();
+#endif
+        if (bHasAnyIPAddress)
         {
-            m_pUDPContext->setMulticastTTL(MDNS_MULTICAST_TTL);
-            m_pUDPContext->onRx(std::bind(&MDNSResponder::_callProcess, this));
+            m_pUDPContext = new UdpContext;
+            if (m_pUDPContext)
+            {
+                m_pUDPContext->ref();
 
-            bResult = m_pUDPContext->connect(&multicast_addr, DNS_MQUERY_PORT);
+                if (m_pUDPContext->listen(IP_ANY_TYPE, DNS_MQUERY_PORT))
+                {
+                    m_pUDPContext->setMulticastInterface(m_pNetIf);
+                    m_pUDPContext->setMulticastTTL(MDNS_MULTICAST_TTL);
+                    m_pUDPContext->onRx(std::bind(&MDNSResponder::_callProcess, this));
+
+                    bResult = m_pUDPContext->connect(IP_ANY_TYPE, DNS_MQUERY_PORT);
+                }
+                if (!bResult)
+                {
+                    _releaseUDPContext();
+                }
+                else
+                {
+                    DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _allocUDPContext: Succeeded to alloc UDPContext!\n")););
+                }
+            }
+            else
+            {
+                DEBUG_EX_ERR(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _allocUDPContext: FAILED to alloc UDPContext!\n")););
+            }
+        }
+        else
+        {
+            DEBUG_EX_INFO(DEBUG_OUTPUT.printf_P(PSTR("[MDNSResponder] _allocUDPContext: NO IP address assigned yet!")););
         }
     }
     return bResult;
@@ -253,58 +424,58 @@ bool MDNSResponder::_releaseUDPContext(void)
 
 
 /*
-    SERVICE QUERY
+    QUERIES
 */
 
 /*
-    MDNSResponder::_allocServiceQuery
+    MDNSResponder::_allocQuery
 */
-MDNSResponder::stcMDNSServiceQuery* MDNSResponder::_allocServiceQuery(void)
+MDNSResponder::stcMDNSQuery* MDNSResponder::_allocQuery(MDNSResponder::stcMDNSQuery::enuQueryType p_QueryType)
 {
 
-    stcMDNSServiceQuery*    pServiceQuery = new stcMDNSServiceQuery;
-    if (pServiceQuery)
+    stcMDNSQuery*    pQuery = new stcMDNSQuery(p_QueryType);
+    if (pQuery)
     {
         // Link to query list
-        pServiceQuery->m_pNext = m_pServiceQueries;
-        m_pServiceQueries = pServiceQuery;
+        pQuery->m_pNext = m_pQueries;
+        m_pQueries = pQuery;
     }
-    return m_pServiceQueries;
+    return m_pQueries;
 }
 
 /*
-    MDNSResponder::_removeServiceQuery
+    MDNSResponder::_removeQuery
 */
-bool MDNSResponder::_removeServiceQuery(MDNSResponder::stcMDNSServiceQuery* p_pServiceQuery)
+bool MDNSResponder::_removeQuery(MDNSResponder::stcMDNSQuery* p_pQuery)
 {
 
     bool    bResult = false;
 
-    if (p_pServiceQuery)
+    if (p_pQuery)
     {
-        stcMDNSServiceQuery*    pPred = m_pServiceQueries;
+        stcMDNSQuery*    pPred = m_pQueries;
         while ((pPred) &&
-                (pPred->m_pNext != p_pServiceQuery))
+                (pPred->m_pNext != p_pQuery))
         {
             pPred = pPred->m_pNext;
         }
         if (pPred)
         {
-            pPred->m_pNext = p_pServiceQuery->m_pNext;
-            delete p_pServiceQuery;
+            pPred->m_pNext = p_pQuery->m_pNext;
+            delete p_pQuery;
             bResult = true;
         }
         else    // No predecesor
         {
-            if (m_pServiceQueries == p_pServiceQuery)
+            if (m_pQueries == p_pQuery)
             {
-                m_pServiceQueries = p_pServiceQuery->m_pNext;
-                delete p_pServiceQuery;
+                m_pQueries = p_pQuery->m_pNext;
+                delete p_pQuery;
                 bResult = true;
             }
             else
             {
-                DEBUG_EX_ERR(DEBUG_OUTPUT.println("[MDNSResponder] _releaseServiceQuery: INVALID service query!"););
+                DEBUG_EX_ERR(DEBUG_OUTPUT.println("[MDNSResponder] _releaseQuery: INVALID query!"););
             }
         }
     }
@@ -312,87 +483,92 @@ bool MDNSResponder::_removeServiceQuery(MDNSResponder::stcMDNSServiceQuery* p_pS
 }
 
 /*
-    MDNSResponder::_removeLegacyServiceQuery
+    MDNSResponder::_removeLegacyQuery
 */
-bool MDNSResponder::_removeLegacyServiceQuery(void)
+bool MDNSResponder::_removeLegacyQuery(void)
 {
 
-    stcMDNSServiceQuery*    pLegacyServiceQuery = _findLegacyServiceQuery();
-    return (pLegacyServiceQuery ? _removeServiceQuery(pLegacyServiceQuery) : true);
+    stcMDNSQuery*    pLegacyQuery = _findLegacyQuery();
+    return (pLegacyQuery ? _removeQuery(pLegacyQuery) : true);
 }
 
 /*
-    MDNSResponder::_findServiceQuery
+    MDNSResponder::_findQuery
 
-    'Convert' hMDNSServiceQuery to stcMDNSServiceQuery* (ensure existance)
+    'Convert' hMDNSQuery to stcMDNSQuery* (ensure existance)
 
 */
-MDNSResponder::stcMDNSServiceQuery* MDNSResponder::_findServiceQuery(MDNSResponder::hMDNSServiceQuery p_hServiceQuery)
+MDNSResponder::stcMDNSQuery* MDNSResponder::_findQuery(MDNSResponder::hMDNSQuery p_hQuery)
 {
 
-    stcMDNSServiceQuery*    pServiceQuery = m_pServiceQueries;
-    while (pServiceQuery)
+    stcMDNSQuery*    pQuery = m_pQueries;
+    while (pQuery)
     {
-        if ((hMDNSServiceQuery)pServiceQuery == p_hServiceQuery)
+        if ((hMDNSQuery)pQuery == p_hQuery)
         {
             break;
         }
-        pServiceQuery = pServiceQuery->m_pNext;
+        pQuery = pQuery->m_pNext;
     }
-    return pServiceQuery;
+    return pQuery;
 }
 
 /*
-    MDNSResponder::_findLegacyServiceQuery
+    MDNSResponder::_findLegacyQuery
 */
-MDNSResponder::stcMDNSServiceQuery* MDNSResponder::_findLegacyServiceQuery(void)
+MDNSResponder::stcMDNSQuery* MDNSResponder::_findLegacyQuery(void)
 {
 
-    stcMDNSServiceQuery*    pServiceQuery = m_pServiceQueries;
-    while (pServiceQuery)
+    stcMDNSQuery*    pQuery = m_pQueries;
+    while (pQuery)
     {
-        if (pServiceQuery->m_bLegacyQuery)
+        if (pQuery->m_bLegacyQuery)
         {
             break;
         }
-        pServiceQuery = pServiceQuery->m_pNext;
+        pQuery = pQuery->m_pNext;
     }
-    return pServiceQuery;
+    return pQuery;
 }
 
 /*
-    MDNSResponder::_releaseServiceQueries
+    MDNSResponder::_releaseQueries
 */
-bool MDNSResponder::_releaseServiceQueries(void)
+bool MDNSResponder::_releaseQueries(void)
 {
-    while (m_pServiceQueries)
+
+    while (m_pQueries)
     {
-        stcMDNSServiceQuery*    pNext = m_pServiceQueries->m_pNext;
-        delete m_pServiceQueries;
-        m_pServiceQueries = pNext;
+        stcMDNSQuery*    pNext = m_pQueries->m_pNext;
+        delete m_pQueries;
+        m_pQueries = pNext;
     }
     return true;
 }
 
 /*
-    MDNSResponder::_findNextServiceQueryByServiceType
+    MDNSResponder::_findNextQueryByDomain
 */
-MDNSResponder::stcMDNSServiceQuery* MDNSResponder::_findNextServiceQueryByServiceType(const stcMDNS_RRDomain& p_ServiceTypeDomain,
-        const stcMDNSServiceQuery* p_pPrevServiceQuery)
+MDNSResponder::stcMDNSQuery* MDNSResponder::_findNextQueryByDomain(const stcMDNS_RRDomain& p_Domain,
+        const MDNSResponder::stcMDNSQuery::enuQueryType p_QueryType,
+        const stcMDNSQuery* p_pPrevQuery)
 {
-    stcMDNSServiceQuery*    pMatchingServiceQuery = 0;
+    stcMDNSQuery*    pMatchingQuery = 0;
 
-    stcMDNSServiceQuery*    pServiceQuery = (p_pPrevServiceQuery ? p_pPrevServiceQuery->m_pNext : m_pServiceQueries);
-    while (pServiceQuery)
+    stcMDNSQuery*    pQuery = (p_pPrevQuery ? p_pPrevQuery->m_pNext : m_pQueries);
+    while (pQuery)
     {
-        if (p_ServiceTypeDomain == pServiceQuery->m_ServiceTypeDomain)
+        if (((stcMDNSQuery::enuQueryType::None == p_QueryType) ||
+                (pQuery->m_QueryType == p_QueryType)) &&
+                (p_Domain == pQuery->m_Domain))
         {
-            pMatchingServiceQuery = pServiceQuery;
+
+            pMatchingQuery = pQuery;
             break;
         }
-        pServiceQuery = pServiceQuery->m_pNext;
+        pQuery = pQuery->m_pNext;
     }
-    return pMatchingServiceQuery;
+    return pMatchingQuery;
 }
 
 
@@ -428,6 +604,9 @@ bool MDNSResponder::_setHostname(const char* p_pcHostname)
 #else
             strncpy(m_pcHostname, p_pcHostname, (stLength + 1));
 #endif
+            /*  if (m_pNetIf) {
+                netif_set_hostname(m_pNetIf, m_pcHostname);
+                }*/
         }
     }
     return bResult;
@@ -443,6 +622,10 @@ bool MDNSResponder::_releaseHostname(void)
     {
         delete[] m_pcHostname;
         m_pcHostname = 0;
+        if (m_pNetIf)
+        {
+            netif_set_hostname(m_pNetIf, m_pcHostname);
+        }
     }
     return true;
 }
@@ -563,12 +746,12 @@ MDNSResponder::stcMDNSService* MDNSResponder::_findService(const char* p_pcName,
 }
 
 /*
-    MDNSResponder::_findService
+    MDNSResponder::_findService (const)
 */
-MDNSResponder::stcMDNSService* MDNSResponder::_findService(const MDNSResponder::hMDNSService p_hService)
+const MDNSResponder::stcMDNSService* MDNSResponder::_findService(const MDNSResponder::hMDNSService p_hService) const
 {
 
-    stcMDNSService* pService = m_pServices;
+    const stcMDNSService*   pService = m_pServices;
     while (pService)
     {
         if (p_hService == (hMDNSService)pService)
@@ -578,6 +761,15 @@ MDNSResponder::stcMDNSService* MDNSResponder::_findService(const MDNSResponder::
         pService = pService->m_pNext;
     }
     return pService;
+}
+
+/*
+    MDNSResponder::_findService
+*/
+MDNSResponder::stcMDNSService* MDNSResponder::_findService(const MDNSResponder::hMDNSService p_hService)
+{
+
+    return (stcMDNSService*)(((const MDNSResponder*)this)->_findService(p_hService));
 }
 
 
@@ -714,11 +906,14 @@ MDNSResponder::stcMDNSServiceTxt* MDNSResponder::_addServiceTxt(MDNSResponder::s
     return pResult;
 }
 
-MDNSResponder::stcMDNSServiceTxt* MDNSResponder::_answerKeyValue(const hMDNSServiceQuery p_hServiceQuery,
+/*
+    MDNSResponder::_answerKeyValue
+*/
+MDNSResponder::stcMDNSServiceTxt* MDNSResponder::_answerKeyValue(const MDNSResponder::hMDNSQuery p_hQuery,
         const uint32_t p_u32AnswerIndex)
 {
-    stcMDNSServiceQuery*            pServiceQuery = _findServiceQuery(p_hServiceQuery);
-    stcMDNSServiceQuery::stcAnswer* pSQAnswer = (pServiceQuery ? pServiceQuery->answerAtIndex(p_u32AnswerIndex) : 0);
+    stcMDNSQuery*            pQuery = _findQuery(p_hQuery);
+    stcMDNSQuery::stcAnswer* pSQAnswer = (pQuery ? pQuery->answerAtIndex(p_u32AnswerIndex) : 0);
     // Fill m_pcTxts (if not already done)
     return (pSQAnswer) ?  pSQAnswer->m_Txts.m_pTxts : 0;
 }
@@ -729,14 +924,13 @@ MDNSResponder::stcMDNSServiceTxt* MDNSResponder::_answerKeyValue(const hMDNSServ
 bool MDNSResponder::_collectServiceTxts(MDNSResponder::stcMDNSService& p_rService)
 {
 
-    // Call Dynamic service callbacks
     if (m_fnServiceTxtCallback)
     {
-        m_fnServiceTxtCallback((hMDNSService)&p_rService);
+        m_fnServiceTxtCallback(this, (hMDNSService)&p_rService);
     }
     if (p_rService.m_fnTxtCallback)
     {
-        p_rService.m_fnTxtCallback((hMDNSService)&p_rService);
+        p_rService.m_fnTxtCallback(this, (hMDNSService)&p_rService);
     }
     return true;
 }
@@ -801,7 +995,7 @@ bool MDNSResponder::_printRRAnswer(const MDNSResponder::stcMDNS_RRAnswer& p_RRAn
     DEBUG_OUTPUT.printf_P(PSTR(" Type:0x%04X Class:0x%04X TTL:%u, "), p_RRAnswer.m_Header.m_Attributes.m_u16Type, p_RRAnswer.m_Header.m_Attributes.m_u16Class, p_RRAnswer.m_u32TTL);
     switch (p_RRAnswer.m_Header.m_Attributes.m_u16Type & (~0x8000))     // Topmost bit might carry 'cache flush' flag
     {
-#ifdef MDNS_IP4_SUPPORT
+#ifdef MDNS_IPV4_SUPPORT
     case DNS_RRTYPE_A:
         DEBUG_OUTPUT.printf_P(PSTR("A IP:%s"), ((const stcMDNS_RRAnswerA*)&p_RRAnswer)->m_IPAddress.toString().c_str());
         break;
@@ -822,9 +1016,9 @@ bool MDNSResponder::_printRRAnswer(const MDNSResponder::stcMDNS_RRAnswer& p_RRAn
         }
         break;
     }
-#ifdef MDNS_IP6_SUPPORT
+#ifdef MDNS_IPV6_SUPPORT
     case DNS_RRTYPE_AAAA:
-        DEBUG_OUTPUT.printf_P(PSTR("AAAA IP:%s"), ((stcMDNS_RRAnswerA*&)p_rpRRAnswer)->m_IPAddress.toString().c_str());
+        DEBUG_OUTPUT.printf_P(PSTR("AAAA IP:%s"), ((stcMDNS_RRAnswerAAAA*&)p_RRAnswer)->m_IPAddress.toString().c_str());
         break;
 #endif
     case DNS_RRTYPE_SRV:
@@ -838,6 +1032,102 @@ bool MDNSResponder::_printRRAnswer(const MDNSResponder::stcMDNS_RRAnswer& p_RRAn
     DEBUG_OUTPUT.printf_P(PSTR("\n"));
 
     return true;
+}
+/*
+    MDNSResponder::_RRType2Name
+*/
+const char* MDNSResponder::_RRType2Name(uint16_t p_u16RRType) const
+{
+
+    static char acRRName[16];
+    *acRRName = 0;
+
+    switch (p_u16RRType & (~0x8000))    // Topmost bit might carry 'cache flush' flag
+    {
+    case DNS_RRTYPE_A:      strcpy(acRRName, "A");      break;
+    case DNS_RRTYPE_PTR:    strcpy(acRRName, "PTR");    break;
+    case DNS_RRTYPE_TXT:    strcpy(acRRName, "TXT");    break;
+    case DNS_RRTYPE_AAAA:   strcpy(acRRName, "AAAA");   break;
+    case DNS_RRTYPE_SRV:    strcpy(acRRName, "SRV");    break;
+    case DNS_RRTYPE_NSEC:   strcpy(acRRName, "NSEC");   break;
+    default:
+        sprintf(acRRName, "Unknown(0x%04X)", p_u16RRType);  // MAX 15!
+    }
+    return acRRName;
+}
+/*
+    MDNSResponder::_RRClass2String
+*/
+const char* MDNSResponder::_RRClass2String(uint16_t p_u16RRClass,
+        bool p_bIsQuery) const
+{
+
+    static char acClassString[16];
+    *acClassString = 0;
+
+    if (p_u16RRClass & 0x0001)
+    {
+        strcat(acClassString, "IN ");    //  3
+    }
+    if (p_u16RRClass & 0x8000)
+    {
+        strcat(acClassString, (p_bIsQuery ? "UNICAST " : "FLUSH "));    //  8/6
+    }
+
+    return acClassString;                                                                       // 11
+}
+/*
+    MDNSResponder::_replyFlags2String
+*/
+const char* MDNSResponder::_replyFlags2String(uint32_t p_u32ReplyFlags) const
+{
+
+    static char acFlagsString[64];
+
+    *acFlagsString = 0;
+    if (p_u32ReplyFlags & static_cast<uint32_t>(enuContentFlag::A))
+    {
+        strcat(acFlagsString, "A ");    //  2
+    }
+    if (p_u32ReplyFlags & static_cast<uint32_t>(enuContentFlag::PTR_IPv4))
+    {
+        strcat(acFlagsString, "PTR_IPv4 ");    //  7
+    }
+    if (p_u32ReplyFlags & static_cast<uint32_t>(enuContentFlag::PTR_IPv6))
+    {
+        strcat(acFlagsString, "PTR_IPv6 ");    //  7
+    }
+    if (p_u32ReplyFlags & static_cast<uint32_t>(enuContentFlag::AAAA))
+    {
+        strcat(acFlagsString, "AAAA ");    //  5
+    }
+    if (p_u32ReplyFlags & static_cast<uint32_t>(enuContentFlag::PTR_TYPE))
+    {
+        strcat(acFlagsString, "PTR_TYPE ");    //  9
+    }
+    if (p_u32ReplyFlags & static_cast<uint32_t>(enuContentFlag::PTR_NAME))
+    {
+        strcat(acFlagsString, "PTR_NAME ");    //  9
+    }
+    if (p_u32ReplyFlags & static_cast<uint32_t>(enuContentFlag::TXT))
+    {
+        strcat(acFlagsString, "TXT ");    //  4
+    }
+    if (p_u32ReplyFlags & static_cast<uint32_t>(enuContentFlag::SRV))
+    {
+        strcat(acFlagsString, "SRV ");    //  4
+    }
+    if (p_u32ReplyFlags & static_cast<uint32_t>(enuContentFlag::NSEC))
+    {
+        strcat(acFlagsString, "NSEC ");    //  5
+    }
+
+    if (0 == p_u32ReplyFlags)
+    {
+        strcpy(acFlagsString, "none");
+    }
+
+    return acFlagsString;                                                                           // 63
 }
 #endif
 
